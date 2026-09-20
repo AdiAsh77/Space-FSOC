@@ -4,7 +4,6 @@ using System.Text;
 
 public class CameraStreamer : MonoBehaviour
 {
-
     public TrackingMetrics trackingMetrics;
 
     public float panGain = 0.05f;
@@ -12,7 +11,6 @@ public class CameraStreamer : MonoBehaviour
 
     public float maxPanSpeed = 2f;
     public float maxTiltSpeed = 2f;
-
 
     public Camera cam;
 
@@ -29,6 +27,7 @@ public class CameraStreamer : MonoBehaviour
     private float timer;
 
     private int frameId = 0;
+
     // Buffer for receiving Python's response
     private byte[] receiveBuffer = new byte[1024];
     private string receiveString = "";
@@ -103,13 +102,18 @@ public class CameraStreamer : MonoBehaviour
         byte[] idBytes = System.BitConverter.GetBytes(frameId);
         byte[] sizeBytes = System.BitConverter.GetBytes(image.Length);
 
-        // Send frame ID
+        // Message type 1 = image frame
+        byte[] messageType = new byte[] { 1 };
+
+        stream.Write(messageType, 0, 1);
+
+        // Frame ID
         stream.Write(idBytes, 0, 4);
 
-        // Send image size
+        // Image size
         stream.Write(sizeBytes, 0, 4);
 
-        // Send JPEG
+        // JPEG
         stream.Write(image, 0, image.Length);
     }
 
@@ -167,7 +171,12 @@ public class CameraStreamer : MonoBehaviour
         }
     }
 
-    void CalculateError(float x1, float y1, float x2, float y2)
+    void CalculateError(
+        float x1,
+        float y1,
+        float x2,
+        float y2
+    )
     {
         float beaconX = (x1 + x2) / 2f;
         float beaconY = (y1 + y2) / 2f;
@@ -201,7 +210,7 @@ public class CameraStreamer : MonoBehaviour
         if (Mathf.Abs(errorY) < 5f)
             errorY = 0f;
 
-        // Calculate movement
+        // Calculate movement in degrees
         float pan = errorX * panGain;
         float tilt = -errorY * tiltGain;
 
@@ -225,6 +234,50 @@ public class CameraStreamer : MonoBehaviour
             0f,
             Space.Self
         );
+
+        // Send the camera's ACTUAL current orientation
+        SendPanTilt();
+    }
+
+    void SendPanTilt()
+    {
+        if (stream == null)
+            return;
+
+        Vector3 rotation = cam.transform.localEulerAngles;
+
+        // Convert Unity's 0-360 degree representation
+        // into a signed -180 to +180 representation.
+        float pan = NormalizeAngle(rotation.y);
+        float tilt = NormalizeAngle(rotation.x);
+
+        string message =
+            $"PANTILT,{pan:F4},{tilt:F4}\n";
+
+        byte[] data = Encoding.UTF8.GetBytes(message);
+
+        // Message type 2 = pan/tilt
+        byte[] messageType = new byte[] { 2 };
+
+        try
+        {
+            stream.Write(messageType, 0, 1);
+            stream.Write(data, 0, data.Length);
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogError(
+                "Failed to send pan/tilt: " + e.Message
+            );
+        }
+    }
+
+    float NormalizeAngle(float angle)
+    {
+        if (angle > 180f)
+            angle -= 360f;
+
+        return angle;
     }
 
     void OnDestroy()

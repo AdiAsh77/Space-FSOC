@@ -42,9 +42,9 @@ Material:
     - _NoiseIntensity: 0
     - _Noise_Intensity: 0
     - _divider: 5
-    - _left: 0.005
+    - _left: -0.01
     - _mul: 0.01
-    - _right: -0.005
+    - _right: 0.01
     m_Colors: []
   m_BuildTextureStacks: []
   m_AllowLocking: 1

@@ -1,4 +1,5 @@
 using UnityEngine;
+using System.Collections;
 
 public class SpaceMovement : MonoBehaviour
 {
@@ -16,8 +17,14 @@ public class SpaceMovement : MonoBehaviour
     public float minRotationAngle = -20f;
     public float maxRotationAngle = 20f;
 
+    [Header("Turbulence")]
+    public float turbulenceStrength = 1f;
+    public float turbulenceDuration = 0.5f;
+
     private float currentAngle = 0f;
     private int rotationDirection = 1;
+
+    private Vector3 turbulenceVelocity = Vector3.zero;
 
     private void Start()
     {
@@ -45,8 +52,11 @@ public class SpaceMovement : MonoBehaviour
             arcMovement = transform.right * arcStrength;
         }
 
+        Vector3 turbulenceMovement = turbulenceVelocity;
+
         transform.position +=
-            (forwardMovement + arcMovement) * Time.deltaTime;
+            (forwardMovement + arcMovement + turbulenceMovement)
+            * Time.deltaTime;
     }
 
     void RotateBackAndForth()
@@ -71,5 +81,22 @@ public class SpaceMovement : MonoBehaviour
             Quaternion.AngleAxis(currentAngle, rotationAxis);
 
         transform.localRotation = rotation;
+    }
+
+    public void Turbulance()
+    {
+        StartCoroutine(TurbulenceCoroutine());
+    }
+
+    IEnumerator TurbulenceCoroutine()
+    {
+        Vector3 randomDirection = Random.onUnitSphere;
+
+        turbulenceVelocity =
+            randomDirection * turbulenceStrength;
+
+        yield return new WaitForSeconds(turbulenceDuration);
+
+        turbulenceVelocity = Vector3.zero;
     }
 }
