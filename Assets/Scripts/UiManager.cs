@@ -73,4 +73,22 @@ public class UiManager : MonoBehaviour
             myText.text = "RETURN";
         }
     }
+
+
+
+    public void SetEffects(
+        float noise,
+        float blur
+    )
+    {
+        cameraImpairmentMaterial.SetFloat(
+            "_NoiseIntensity",
+            noise
+        );
+
+        cameraImpairmentMaterial.SetFloat(
+            "_BlurStrength",
+            blur
+        );
+    }
 }

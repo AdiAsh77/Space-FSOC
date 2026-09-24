@@ -1,5 +1,4 @@
 using UnityEngine;
-using System.Collections;
 
 public class SpaceMovement : MonoBehaviour
 {
@@ -18,18 +17,29 @@ public class SpaceMovement : MonoBehaviour
     public float maxRotationAngle = 20f;
 
     [Header("Turbulence")]
-    public float turbulenceStrength = 1f;
-    public float turbulenceDuration = 0.5f;
+    [Range(0f, 1f)]
+    public float turbulenceStrength = 0f;
+
+    public float minTurbulenceChangeTime = 5f;
+    public float maxTurbulenceChangeTime = 10f;
 
     private float currentAngle = 0f;
     private int rotationDirection = 1;
 
-    private Vector3 turbulenceVelocity = Vector3.zero;
+    private Vector3 turbulenceDirection = Vector3.zero;
+    private Vector3 targetTurbulenceDirection = Vector3.zero;
+
+    private float turbulenceTimer = 0f;
+    private float nextTurbulenceChange = 5f;
+
 
     private void Start()
     {
         currentAngle = 0f;
+
+        ChooseNewTurbulenceDirection();
     }
+
 
     private void Update()
     {
@@ -39,30 +49,45 @@ public class SpaceMovement : MonoBehaviour
         {
             RotateBackAndForth();
         }
+
+        UpdateTurbulence();
     }
+
 
     void MoveForward()
     {
-        Vector3 forwardMovement = transform.forward * speed;
+        Vector3 forwardMovement =
+            transform.forward * speed;
 
-        Vector3 arcMovement = Vector3.zero;
+        Vector3 arcMovement =
+            Vector3.zero;
 
         if (useArcMovement)
         {
-            arcMovement = transform.right * arcStrength;
+            arcMovement =
+                transform.right * arcStrength;
         }
 
-        Vector3 turbulenceMovement = turbulenceVelocity;
+        Vector3 turbulenceMovement =
+            turbulenceDirection *
+            turbulenceStrength;
 
         transform.position +=
-            (forwardMovement + arcMovement + turbulenceMovement)
+            (
+                forwardMovement +
+                arcMovement +
+                turbulenceMovement
+            )
             * Time.deltaTime;
     }
+
 
     void RotateBackAndForth()
     {
         float rotationAmount =
-            rotationDirection * rotationSpeed * Time.deltaTime;
+            rotationDirection *
+            rotationSpeed *
+            Time.deltaTime;
 
         currentAngle += rotationAmount;
 
@@ -78,25 +103,62 @@ public class SpaceMovement : MonoBehaviour
         }
 
         Quaternion rotation =
-            Quaternion.AngleAxis(currentAngle, rotationAxis);
+            Quaternion.AngleAxis(
+                currentAngle,
+                rotationAxis
+            );
 
         transform.localRotation = rotation;
     }
 
-    public void Turbulance()
+
+    void UpdateTurbulence()
     {
-        StartCoroutine(TurbulenceCoroutine());
+        // No turbulence
+        if (turbulenceStrength <= 0f)
+        {
+            turbulenceDirection = Vector3.zero;
+            turbulenceTimer = 0f;
+
+            return;
+        }
+
+        turbulenceTimer += Time.deltaTime;
+
+        // Time to choose a new direction
+        if (turbulenceTimer >= nextTurbulenceChange)
+        {
+            turbulenceTimer = 0f;
+
+            ChooseNewTurbulenceDirection();
+        }
+
+        // Smoothly change towards new direction
+        turbulenceDirection =
+            Vector3.Lerp(
+                turbulenceDirection,
+                targetTurbulenceDirection,
+                Time.deltaTime * 0.5f
+            );
     }
 
-    IEnumerator TurbulenceCoroutine()
+
+    void ChooseNewTurbulenceDirection()
     {
-        Vector3 randomDirection = Random.onUnitSphere;
+        targetTurbulenceDirection =
+            Random.onUnitSphere;
 
-        turbulenceVelocity =
-            randomDirection * turbulenceStrength;
+        nextTurbulenceChange =
+            Random.Range(
+                minTurbulenceChangeTime,
+                maxTurbulenceChangeTime
+            );
+    }
 
-        yield return new WaitForSeconds(turbulenceDuration);
 
-        turbulenceVelocity = Vector3.zero;
+    public void SetTurbulence(float value)
+    {
+        turbulenceStrength =
+            Mathf.Clamp01(value);
     }
 }
