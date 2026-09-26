@@ -21,14 +21,18 @@ from backend import (
     UNITY_EXE,
 )
 
-import sys, os, math, random, tempfile
+# video_tracking (YOLO/torch) must also be imported before PyQt, for the same DLL reason.
+import video_tracking
+from video_tracking import BeaconTracker
+
+import sys, os, math, random, tempfile, threading, time
 import subprocess
 from collections import deque
 
 import numpy as np
 import cv2
 
-from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF, QSize
+from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF, QSize, QThread, pyqtSignal, QPropertyAnimation, QEasingCurve
 from PyQt6.QtGui import (QPainter, QColor, QPen, QBrush, QImage, QRadialGradient, QPolygonF, QFont,
     QIcon, QPixmap, QPalette, QPainterPath, QLinearGradient)
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton, QVBoxLayout,
@@ -39,6 +43,13 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QFrame, QLabel,
 import win32gui  # type: ignore
 import win32con  # type: ignore
 import win32process  # type: ignore
+import glob
+from config import scener
+# Single source of truth for the scenes folder — used by both the Scene-Parameters
+# tab (build_scene_params/save_scene_settings write a .txt file here for every Save)
+# and the Sim View tab (build_sim/refresh_scene_list reads the .txt file names here
+# to populate the "Test case scene" dropdown). Change only this constant to move it.
+SCENES_DIR = scener
 
 LIGHT = dict(bg='#f1f4f9', pn='#ffffff', ink='#0f1b2d', mut='#55647c', ln='#dbe2ec', sd='#0f1a2e', bc='#d63b45', ok='#0b8a6a',
              wn='#b26a00', ac='#2454e6', ach='#1a43c2', onac='#ffffff', soft='#eef2f8')
@@ -81,6 +92,28 @@ def draw_icon(kind, color, size=26):
     elif kind == 'info':     # open book / spec sheet
         q.drawEllipse(QPointF(c, c), 8.5, 8.5); q.setBrush(fill); q.drawEllipse(QPointF(c, c - 4.2), 1.15, 1.15)
         q.drawLine(QPointF(c, c - 1.2), QPointF(c, c + 4.6))
+    elif kind == 'scene':    # parameter sliders (three horizontal tracks with knobs)
+        for y, kx in ((c - 7, 9), (c, 17), (c + 7, 12)):
+            q.drawLine(QPointF(4, y), QPointF(size - 4, y))
+            q.setBrush(fill); q.drawEllipse(QPointF(kx, y), 2.6, 2.6); q.setBrush(Qt.BrushStyle.NoBrush)
+    elif kind == 'beacon':    # Scene-Parameters "Beacon Settings" heading: signal source + radiating waves
+        q.setBrush(fill); q.drawEllipse(QPointF(c, c + c * .44), c * .24, c * .24); q.setBrush(Qt.BrushStyle.NoBrush)
+        q.drawArc(QRectF(c - c * .6, c - c * .6, c * 1.2, c * 1.2), 35 * 16, 110 * 16)
+        q.drawArc(QRectF(c - c * .94, c - c * .94, c * 1.88, c * 1.88), 35 * 16, 110 * 16)
+    elif kind == 'satellite':  # Scene-Parameters "Satellite Settings" heading: body, two panels, antenna
+        b = c * .29
+        q.drawRect(QRectF(c - b, c - b, 2 * b, 2 * b))
+        q.drawRect(QRectF(c - c * .95, c - b * .8, c * .5, b * 1.6)); q.drawRect(QRectF(c + c * .45, c - b * .8, c * .5, b * 1.6))
+        q.drawLine(QPointF(c - c * .45, c), QPointF(c - b, c)); q.drawLine(QPointF(c + b, c), QPointF(c + c * .45, c))
+        q.drawLine(QPointF(c + b * .6, c - b), QPointF(c + c * .5, c - c * .62))
+        q.setBrush(fill); q.drawEllipse(QPointF(c + c * .5, c - c * .62), c * .11, c * .11)
+    elif kind == 'disturbance':   # Scene-Parameters "Disturbances" heading: jagged noise wave
+        q.drawPolyline(QPolygonF([QPointF(size * .14, c), QPointF(size * .33, c - c * .56), QPointF(size * .5, c + c * .56),
+                                   QPointF(size * .67, c - c * .56), QPointF(size * .86, c)]))
+    elif kind == 'camera':     # Scene-Parameters "Camera Settings" heading: body, viewfinder bump, lens
+        q.drawRoundedRect(QRectF(size * .14, c - c * .44, size * .72, c * .88), c * .24, c * .24)
+        q.drawRect(QRectF(c - c * .27, c - c * .71, c * .54, c * .29))
+        q.setBrush(Qt.BrushStyle.NoBrush); q.drawEllipse(QPointF(c, c), c * .29, c * .29)
     else:                    # theme: half-filled circle
         q.drawEllipse(QPointF(c, c), 8, 8); q.setBrush(fill); q.drawPie(QRectF(c - 8, c - 8, 16, 16), 90 * 16, 180 * 16)
     q.end(); return pm
@@ -154,7 +187,7 @@ STARS = [(_r.random() * 320, _r.random() * 240, .3 + _r.random() * .7) for _ in 
 class Sim:
     """Stand-in for the closed loop: disturbance -> detector -> Kalman -> pan/tilt controller."""
     def __init__(s):
-        s.p = dict(noise=.35, sd=1.2, jit=.6, plat=.5, atm=.4)
+        s.p = dict(noise=0, blur=0, atm=0, sd=0, jit=0, plat=0)
         s.type, s.running = 'Mixed', True
         s.reset()
 
@@ -210,70 +243,118 @@ class Sim:
 
 
 class Video:
-    """MP4 input: threshold + centroid beacon detector (no GPU / training data needed)."""
+    """State for the imported MP4. The detection itself (YOLO + Kalman, video_tracking.BeaconTracker)
+    runs in VideoWorker; this just holds the latest frame / metrics for the Video View widgets."""
     def __init__(s):
-        s.cap = None; s.active = False; s.paused = False; s.reset()
+        s.worker = None; s.active = False; s.paused = False; s.reset()
 
     def reset(s):
-        s.frame = None; s.pan = s.tilt = s.ox = s.oy = s.t = 0.
-        s.det = False; s.err, s.rows, s.n = [], [], 0
+        s.frame = s.raw = None; s.t = 0.; s.det = False; s.info = {}
+        s.err, s.rows, s.n = [], [], 0
 
-    def open(s, path):
-        s.cap = cv2.VideoCapture(path); s.active = s.cap.isOpened(); s.paused = False; s.reset()
-        return s.active
-
-    def read(s):
-        ok, f = s.cap.read()
-        if not ok:
-            s.cap.set(cv2.CAP_PROP_POS_FRAMES, 0); return
-        rgb = cv2.cvtColor(cv2.resize(f, (320, 240)), cv2.COLOR_BGR2RGB)
-        gray = rgb.mean(axis=2); m = gray.max(); s.det = False
-        if m > 140:
-            ys, xs = np.nonzero(gray > m * .92)
-            s.det = True; s.ox, s.oy = xs.mean() - 160, ys.mean() - 120
-            s.pan += .25 * (s.ox - s.pan); s.tilt += .25 * (s.oy - s.tilt)
-        s.err.append(math.hypot(s.ox, s.oy) if s.det else 0); del s.err[:-300]
-        s.frame = QImage(rgb.data, 320, 240, 960, QImage.Format.Format_RGB888).copy()
-        s.t = s.cap.get(cv2.CAP_PROP_POS_MSEC) / 1000; s.n += 1
+    def update(s, img, raw, info):
+        s.frame, s.raw, s.info = img, raw, info
+        s.t, s.det = info['video_time'], info['detected']
+        s.n += 1
+        if info['acquisition_complete']:
+            s.err.append(info['error']); del s.err[:-300]
         if s.n % 6 == 0:
-            s.rows.insert(0, (f"{s.t:.1f}s", f"{s.ox:.0f}" if s.det else '-', f"{s.oy:.0f}" if s.det else '-',
-                              'Beacon found' if s.det else 'Not found'))
+            bo = info['beacon_offset']
+            if not info['acquisition_complete']: state = 'Acquiring' if s.det else 'Searching'
+            else: state = 'Tracking' if s.det else 'Target lost'
+            s.rows.insert(0, (f"{s.t:.1f}s", f"{bo[0]:.0f}" if bo else '-', f"{bo[1]:.0f}" if bo else '-', state))
             del s.rows[5:]
+
+
+class VideoWorker(QThread):
+    """Reads the MP4 and runs video_tracking.BeaconTracker on every frame, off the GUI thread.
+    Pause clears the play event, which stops BOTH the video and the detection; Play resumes both."""
+    result = pyqtSignal(object, object, object)   # (annotated QImage, raw QImage, info dict incl. the annotated cv2 frame)
+    status = pyqtSignal(str)
+    failed = pyqtSignal(str)
+    ended = pyqtSignal(str)   # message about the saved tracking CSV
+
+    def __init__(s, path):
+        super().__init__(); s.path = path; s.speed = 1.0
+        s._play = threading.Event(); s._play.set()
+        s._quit = False; s._seek = None
+
+    def play(s): s._play.set()
+    def pause(s): s._play.clear()
+    def seek_to(s, frac): s._seek = frac
+    def stop(s): s._quit = True; s._play.set()
+
+    @staticmethod
+    def _qimage(bgr, w, h):
+        out = cv2.resize(bgr, (640, int(h * 640 / w)), interpolation=cv2.INTER_AREA) if w > 640 else bgr
+        rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
+        return QImage(rgb.data, rgb.shape[1], rgb.shape[0], rgb.shape[1] * 3, QImage.Format.Format_RGB888).copy()
+
+    def run(s):
+        cap = cv2.VideoCapture(s.path)
+        if not cap.isOpened():
+            s.failed.emit('Could not open the video.'); return
+        w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 0
+        if fps <= 0: fps = video_tracking.TRACK_CAMERA_FPS
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        try:
+            s.status.emit('Loading YOLO model...')
+            tracker = BeaconTracker(w, h, fps)
+        except Exception as e:
+            cap.release(); s.failed.emit(f'Could not load the detector: {e}'); return
+        s.status.emit('Detection running on the imported video (YOLO + Kalman).')
+        next_t = time.perf_counter()
+        csv_rows = []
+        while not s._quit:
+            frac, s._seek = s._seek, None
+            if frac is not None:
+                # Seek: restart tracking from the new position and show one frame even if paused.
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(frac * total) if total > 0 else 0)
+                tracker.reset(); csv_rows = []; next_t = time.perf_counter()
+            elif not s._play.is_set():
+                s._play.wait(0.05); next_t = time.perf_counter(); continue
+            ok, frame = cap.read()
+            if not ok:
+                # End of video: pause, rewind to the start (tracking restarts on the next Play).
+                # The tracking CSV is written when the video has played through.
+                try: msg = f"Tracking data saved to {video_tracking.write_csv(csv_rows)}"
+                except Exception as e: msg = f"Could not save tracking CSV: {e}"
+                s._play.clear(); s._seek = 0.0; s.ended.emit(msg); continue
+            idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+            raw_img = s._qimage(frame, w, h)                 # untouched copy: process() draws on `frame`
+            info = tracker.process(frame)
+            csv_rows.append(video_tracking.csv_row(info))
+            info.update(video_time=idx / fps, frame_index=idx, total=total, pos_frac=idx / total if total > 0 else 0.)
+            s.result.emit(s._qimage(frame, w, h), raw_img, info)
+            # pace to the video's own frame rate (x speed); if detection is slower, just run flat out
+            next_t += 1 / (fps * s.speed); d = next_t - time.perf_counter()
+            if d > 0: time.sleep(d)
+            elif d < -1: next_t = time.perf_counter()
+        cap.release()
 
 # --------------------------------------------------------------------------- custom widgets
 def _canvas_bg(q, w, h):
     path = QPainterPath(); path.addRoundedRect(QRectF(0, 0, w, h), 9, 9); q.setClipPath(path); q.fillRect(0, 0, w, h, QColor('#070c18'))
 
 class CamView(QWidget):
-    """Python-side camera view: simulated feed, or the imported video frame with detector box."""
-    def __init__(s, sim, video=None):
-        super().__init__(); s.sim, s.video = sim, video; s.setMinimumSize(210, 150)
+    """Video View camera panel. mode 'py': the annotated frame from the video detector (YOLO box,
+    Kalman estimate, etc.); mode 'raw': the plain imported mp4. Blank prompt when nothing is imported."""
+    def __init__(s, video):
+        super().__init__(); s.video = video; s.mode = 'py'; s.setMinimumSize(210, 150)
 
     def paintEvent(s, _):
-        q = QPainter(s); q.setRenderHint(QPainter.RenderHint.Antialiasing)
+        q = QPainter(s); q.setRenderHint(QPainter.RenderHint.Antialiasing); q.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         w, h = s.width(), s.height(); _canvas_bg(q, w, h); k = min(w / 320, h / 240)
         q.translate((w - 320 * k) / 2, (h - 240 * k) / 2); q.scale(k, k); q.setClipRect(QRectF(0, 0, 320, 240), Qt.ClipOperation.IntersectClip)
-        v, m = s.video, s.sim
-        if v and v.active and v.frame is not None:
-            q.drawImage(QRectF(0, 0, 320, 240), v.frame)
-            if v.det:
-                q.setPen(QPen(QColor('#22d3a0'), 1.5)); q.setBrush(Qt.BrushStyle.NoBrush); q.drawRect(QRectF(v.ox + 148, v.oy + 108, 24, 24))
+        v = s.video
+        img = (v.raw if s.mode == 'raw' else v.frame) if v and v.active else None   # 'raw' = plain mp4, nothing drawn on it
+        if img is not None:
+            iw, ih = img.width(), img.height(); r = min(320 / iw, 240 / ih); dw, dh = iw * r, ih * r
+            q.drawImage(QRectF((320 - dw) / 2, (240 - dh) / 2, dw, dh), img)
             return
-        q.setPen(Qt.PenStyle.NoPen)
-        for sx, sy, a in STARS:
-            q.setBrush(QColor(159, 179, 217, int(a * 255))); q.drawRect(QRectF((sx - m.pan * .4) % 320, (sy - m.tilt * .4) % 240, 1.4, 1.4))
-        for _ in range(int(m.p['noise'] * 120)):
-            q.setPen(QColor(255, 255, 255, int(random.random() * 60))); q.drawPoint(QPointF(random.random() * 320, random.random() * 240))
-        bx, by = 160 + m.ox, 120 + m.oy
-        g = QRadialGradient(bx, by, 14); g.setColorAt(0, QColor('#ffffff')); g.setColorAt(.25, QColor('#ff5a5f')); g.setColorAt(1, QColor(229, 72, 77, 0))
-        q.setPen(Qt.PenStyle.NoPen); q.setBrush(QBrush(g)); q.drawEllipse(QPointF(bx, by), 14, 14)
-        q.setBrush(Qt.BrushStyle.NoBrush); q.setPen(QPen(QColor('#4a5b80'), 1)); q.drawEllipse(QPointF(160, 120), 60, 60)
-        q.drawLine(150, 120, 170, 120); q.drawLine(160, 110, 160, 130)
-        if m.det:
-            q.setPen(QPen(QColor('#22d3a0'), 1.5)); q.drawRect(QRectF(m.mx + 148, m.my + 108, 24, 24))
-            q.setFont(QFont('Sans', 6)); q.drawText(QPointF(m.mx + 148, m.my + 105), 'beacon')
-        q.setPen(QPen(QColor('#f5b942'), 1.5)); kx, ky = 160 + m.kx, 120 + m.ky
-        q.drawLine(QPointF(kx - 7, ky), QPointF(kx + 7, ky)); q.drawLine(QPointF(kx, ky - 7), QPointF(kx, ky + 7))
+        q.setPen(QColor('#8fa3c7')); q.drawText(QRectF(0, 0, 320, 240), Qt.AlignmentFlag.AlignCenter,
+                                                 'Loading video...' if v and v.active else 'No video imported')
 
 
 class SatView(QWidget):
@@ -305,22 +386,29 @@ class SatView(QWidget):
 
 
 class Chart(QWidget):
-    def __init__(s, provider, ymax, thresh=0):
-        super().__init__(); s.provider, s.ymax, s.thresh = provider, ymax, thresh; s.setMinimumHeight(110)
+    def __init__(s, provider, ymax, thresh=0, auto=False):
+        super().__init__(); s.provider, s.ymax, s.thresh, s.auto = provider, ymax, thresh, auto; s.setMinimumHeight(110)
+
+    def _ymax(s, a):
+        """Fixed ymax, or (auto) the largest value on screen rounded up to a tidy number."""
+        if not s.auto or not a: return s.ymax
+        m = max(max(a) * 1.15, 5)
+        e = 10 ** math.floor(math.log10(m))
+        return next(k * e for k in (1, 2, 2.5, 5, 10) if m <= k * e)
 
     def paintEvent(s, _):
         q = QPainter(s); q.setRenderHint(QPainter.RenderHint.Antialiasing); w, h = s.width(), s.height()
         path = QPainterPath(); path.addRoundedRect(QRectF(0, 0, w, h), 9, 9); q.setClipPath(path); q.fillRect(0, 0, w, h, QColor(T['soft']))
         f = q.font(); f.setPointSize(8); q.setFont(f)
+        a = s.provider(); ymax = s._ymax(a); fmt = '.1f' if ymax < 10 else '.0f'
         for i in range(1, 4):
             y = h * i // 4; q.setPen(QPen(QColor(T['ln']), 1)); q.drawLine(0, y, w, y)
-            q.setPen(QColor(T['mut'])); q.drawText(QPointF(8, y - 3), f"{s.ymax * (1 - i / 4):.0f}")
+            q.setPen(QColor(T['mut'])); q.drawText(QPointF(8, y - 3), f"{ymax * (1 - i / 4):{fmt}}")
         if s.thresh:
-            y = h - s.thresh / s.ymax * h; q.setPen(QPen(QColor(T['wn']), 1, Qt.PenStyle.DashLine)); q.drawLine(QPointF(0, y), QPointF(w, y))
+            y = h - s.thresh / ymax * h; q.setPen(QPen(QColor(T['wn']), 1, Qt.PenStyle.DashLine)); q.drawLine(QPointF(0, y), QPointF(w, y))
             q.setPen(QColor(T['wn'])); q.drawText(QPointF(w - 64, y - 4), 'lock zone')
-        a = s.provider()
         if len(a) > 1:
-            pts = [QPointF(i / 299 * w, h - min(v, s.ymax) / s.ymax * h) for i, v in enumerate(a)]
+            pts = [QPointF(i / 299 * w, h - min(v, ymax) / ymax * h) for i, v in enumerate(a)]
             line = QPainterPath(pts[0])
             for p in pts[1:]: line.lineTo(p)
             fill = QPainterPath(line); fill.lineTo(pts[-1].x(), h); fill.lineTo(pts[0].x(), h); fill.closeSubpath()
@@ -391,9 +479,9 @@ FM = [1, 2, 2, 0, 0, 1]
 # Pass/fail reference lines pulled from the SIH problem-statement performance table (§16-20).
 # None = no hard spec threshold for that column; else (limit, lower_is_better).
 SPEC_THRESH = [None, (2.0, True), (10.0, True), (1.0, True), (20.0, False), None]
-PARAMS = [('noise', 'Noise level', 100, 100, .35), ('sd', 'Max standard deviation (px)', 50, 10, 1.2),
-          ('jit', 'Max camera jitter (px)', 30, 10, .6), ('plat', 'Platform motion', 100, 100, .5),
-          ('atm', 'Atmospheric disturbance', 100, 100, .4)]
+PARAMS = [('noise', 'Noise level', 100, 100, 0), ('blur', 'Blur Level', 100, 100, 0),
+          ('atm', 'Atmospheric disturbance', 100, 100, 0), ('sd', 'Max standard deviation (px)', 50, 10, 0),
+          ('jit', 'Max camera jitter (px)', 30, 10, 0), ('plat', 'Platform motion', 100, 100, 0),]
 
 # --------------------------------------------------------------------------- spec reference (from problem statement PDF)
 SPEC_CAMERA = [('Screen size (min.)', '2000 x 2000 px', 'User-defined'), ('Camera type', 'Monochrome, focal plane array', 'Colour optional'),
@@ -419,6 +507,17 @@ SPEC_EVAL = [('Functional verification', 20, '#2454e6', 'Live demo of all mandat
 def panel(title, *widgets):
     f = QFrame(); f.setObjectName('panel'); l = QVBoxLayout(f); l.setContentsMargins(16, 14, 16, 16); l.setSpacing(10)
     h = QLabel(title); h.setObjectName('h3'); l.addWidget(h)
+    for w in widgets: l.addWidget(w, 1 if w is widgets[-1] else 0)
+    return f
+
+def panel_with_header_control(title, control, *widgets):
+    """Same as panel(), but with an extra widget (e.g. a QComboBox) pushed to the far
+    right of the title row via a stretch, rather than sitting right beside the title."""
+    f = QFrame(); f.setObjectName('panel'); l = QVBoxLayout(f); l.setContentsMargins(16, 14, 16, 16); l.setSpacing(10)
+    hd = QWidget(); hl = QHBoxLayout(hd); hl.setContentsMargins(0, 0, 0, 0)
+    h = QLabel(title); h.setObjectName('h3')
+    hl.addWidget(h); hl.addStretch(); hl.addWidget(control)
+    l.addWidget(hd)
     for w in widgets: l.addWidget(w, 1 if w is widgets[-1] else 0)
     return f
 
@@ -459,6 +558,73 @@ def row(*ws):
     for x in ws: l.addWidget(x, 1)
     return w
 
+# --------------------------------------------------------------------------- Scene-Parameters builders
+# Everything below is used only by build_scene_params() to keep its four panels'
+# rows aligned in a single shared grid per panel (rather than one independent
+# mini-layout per row, which is what previously let rows drift out of line with
+# each other). See the "SCENE-PARAMETERS LAYOUT" block further down for usage.
+def panel_top(title, icon_kind, *widgets):
+    """Like panel(), but (a) draws a small icon beside the title, and (b) never
+    stretches the last widget to fill leftover panel height — instead any extra
+    space collects below everything, so rows stay at their natural height and
+    evenly spaced instead of one row silently stretching to fill the panel."""
+    f = QFrame(); f.setObjectName('panel'); l = QVBoxLayout(f); l.setContentsMargins(16, 14, 16, 16); l.setSpacing(12)
+    hd = QWidget(); hl = QHBoxLayout(hd); hl.setContentsMargins(0, 0, 0, 0); hl.setSpacing(8)
+    ic = QLabel(); ic.setPixmap(draw_icon(icon_kind, T['ac'], 18))
+    ttl = QLabel(title); ttl.setObjectName('h3')
+    hl.addWidget(ic); hl.addWidget(ttl); hl.addStretch()
+    l.addWidget(hd)
+    for w in widgets: l.addWidget(w, 0)
+    l.addStretch(1)
+    return f
+
+def scene_grid(paired=False):
+    """A QGridLayout-backed container for one panel's rows. With paired=False every
+    row is label|control, control filling the full remaining width (Satellite
+    Settings, Disturbances). With paired=True the grid has two label|control pairs
+    per row (label|control|label|control) so 'Colour'+'Blink' and 'Shape'+'Size'
+    line up with each other and with the full-width rows above/below them
+    (Beacon Settings)."""
+    w = QWidget(); g = QGridLayout(w); g.setContentsMargins(0, 0, 0, 0)
+    g.setVerticalSpacing(12); g.setHorizontalSpacing(10); g.setColumnStretch(1, 1)
+    if paired: g.setColumnStretch(3, 1)
+    return w, g
+
+def grid_full(g, row_i, label, widget):
+    """One label + one control, the control filling the entire rest of the row."""
+    g.addWidget(QLabel(label), row_i, 0); g.addWidget(widget, row_i, 1, 1, 3)
+
+def grid_half(g, row_i, side, label, widget):
+    """Left half (side=0, columns 0-1) or right half (side=1, columns 2-3) of a
+    paired row — used only with scene_grid(paired=True)."""
+    c0 = 0 if side == 0 else 2
+    g.addWidget(QLabel(label), row_i, c0); g.addWidget(widget, row_i, c0 + 1)
+
+def mk_combo(options):
+    cb = QComboBox(); cb.addItems(options); return cb
+
+def mk_toggle(default=True):
+    """ON/OFF pill button for boolean controls (e.g. Blink)."""
+    b = QPushButton('ON' if default else 'OFF'); b.setCheckable(True); b.setChecked(default)
+    b.setFixedWidth(64); b.setCursor(Qt.CursorShape.PointingHandCursor)
+    b.toggled.connect(lambda v: b.setText('ON' if v else 'OFF'))
+    return b
+
+def mk_slider(mn, mx, default, suffix='', divisor=1):
+    """Returns (row_widget, slider) — row_widget (slider + live value label) is
+    what goes in the grid; slider is what save_scene_settings() reads the value from.
+    `divisor` lets the slider's raw integer steps (what QSlider natively works in)
+    display as a fraction — e.g. mn=0, mx=100, divisor=100 gives a 0.00-1.00 range
+    in 0.01 increments per step, while the slider itself just moves 0-100."""
+    row_w = QWidget(); rl = QHBoxLayout(row_w); rl.setContentsMargins(0, 0, 0, 0); rl.setSpacing(8)
+    sl = QSlider(Qt.Orientation.Horizontal); sl.setRange(mn, mx); sl.setValue(default)
+    sl.setProperty('divisor', divisor)   # read back by save_scene_settings()'s value_of()
+    disp = lambda v: f"{v / divisor:g}{suffix}"
+    val = QLabel(disp(default)); val.setFixedWidth(40); val.setAlignment(Qt.AlignmentFlag.AlignRight)
+    sl.valueChanged.connect(lambda v: val.setText(disp(v)))
+    rl.addWidget(sl, 1); rl.addWidget(val)
+    return row_w, sl
+
 # ============================================================
 
 # --------------------------------------------------------------------------- main window
@@ -470,8 +636,11 @@ class Main(QMainWindow):
         s.sel = 0; s.bt = QTimer(s); s.bt.timeout.connect(s.bench_step)
         root = QWidget(); s.setCentralWidget(root); hl = QHBoxLayout(root); hl.setContentsMargins(0, 0, 0, 0); hl.setSpacing(0)
         hl.addWidget(s.build_nav()); s.stack = QStackedWidget(); hl.addWidget(s.stack, 1)
-        for p in (s.build_sim(), s.build_video(), s.build_bench(), s.build_data(), s.build_spec()): s.stack.addWidget(p)
-        s.rail = s.build_rail(); hl.addWidget(s.rail)
+        for p in (s.build_sim(), s.build_scene_params(), s.build_video(), s.build_bench(), s.build_data(), s.build_spec()): s.stack.addWidget(p)
+        s.sim_rail = s.build_sim_rail(); s.video_rail = s.build_video_rail()
+        s.rail_stack = QStackedWidget(); s.rail_stack.setFixedWidth(300)
+        s.rail_stack.addWidget(s.sim_rail); s.rail_stack.addWidget(s.video_rail)
+        hl.addWidget(s.rail_stack)
         s.go(0); s.apply_theme(False); s.draw_data()
         s.timer = QTimer(s); s.timer.timeout.connect(s.tick); s.timer.start(33)
 
@@ -498,13 +667,26 @@ class Main(QMainWindow):
         s.tracking_thread.status_changed.connect(s.on_status_changed)
         s.tracking_thread.stats_ready.connect(s.on_stats_ready)
         s.tracking_thread.start()
+        # Stay paused until "Start Simulation" is pressed on Sim View — Unity launches
+        # and connects automatically below, but sends/receives nothing useful until
+        # then. pause()/is_paused() are safe to call this early: they just flip a
+        # flag the run loop already checks continuously, the same one toggle_sim()
+        # uses later while the thread is mid-loop.
+        s.tracking_thread.pause()
+
+        # Launch Unity automatically instead of waiting for a button press. The
+        # "Start Unity" button still exists (and now starts disabled-after-launch,
+        # same as a manual click would leave it) in case Unity needs restarting.
+        
+        # ........................................................................................
+        # QTimer.singleShot(0, s.start_unity)
 
     # ---- shell
     def build_nav(s):
         f = QFrame(); f.setObjectName('nav'); f.setFixedWidth(76); l = QVBoxLayout(f); l.setContentsMargins(0, 18, 0, 16); l.setSpacing(8)
         logo = QLabel(); logo.setPixmap(beacon_logo()); logo.setAlignment(Qt.AlignmentFlag.AlignCenter); l.addWidget(logo); l.addSpacing(10)
         s.grp = QButtonGroup(s); ctr = Qt.AlignmentFlag.AlignHCenter
-        for i, (k, tip) in enumerate((('sim', 'Sim View'), ('video', 'Video View'), ('bench', 'Benchmark'), ('data', 'Data-Check'), ('info', 'Spec Reference'))):
+        for i, (k, tip) in enumerate((('sim', 'Sim View'), ('scene', 'Scene-Parameters'), ('video', 'Video View'), ('bench', 'Benchmark'), ('data', 'Data-Check'), ('info', 'Spec Reference'))):
             b = QPushButton(); b.setObjectName('nb'); b.setCheckable(True); b.setIcon(make_icon(k)); b.setIconSize(QSize(26, 26))
             b.setFixedSize(52, 48); b.setToolTip(tip); b.setAccessibleName(tip); b.setCursor(Qt.CursorShape.PointingHandCursor)
             s.grp.addButton(b, i); l.addWidget(b, 0, ctr)
@@ -515,14 +697,32 @@ class Main(QMainWindow):
 
     def go(s, i):
         s.stack.setCurrentIndex(i); s.grp.button(i).setChecked(True)
-        if hasattr(s, 'rail'):
-            show_rail = i < 2
-            s.rail.setVisible(show_rail)
-            if show_rail: s._refresh_rail_layout()
+        if i == 0: s.refresh_scene_list()   # pick up any scene saved since Sim View was last shown
+        if hasattr(s, 'rail_stack'):
+            show_rail = i in (0, 2)
+            s.rail_stack.setVisible(show_rail)
+            if show_rail:
+                s.rail_stack.setCurrentIndex(0 if i == 0 else 1)
+                s._refresh_rail_layout()
         s._reparent_unity_to_tab(i)
+        s._apply_view_for_tab(i)
+
+    def _apply_view_for_tab(s, i):
+        """Video View (i==2) always uses TrackingThread.second_view(). Sim View (i==0)
+        always uses whichever of sat_pov() / second_view() the dropdown currently has
+        selected — re-invoked every time Sim View is switched to, not just when the
+        dropdown itself changes. No-ops until tracking_thread exists (e.g. during the
+        early s.go(0) call in __init__) and on any other tab (Scene-Parameters, etc.)."""
+        tt = getattr(s, 'tracking_thread', None)
+        if tt is None:
+            return
+        if i == 2:
+            tt.third_view()
+        elif i == 0:
+            s._invoke_sat_view(getattr(s, 'selected_sat_view', 'Satellite Pov'))
 
     def _reparent_unity_to_tab(s, i):
-        """Sim View (i==0) and Video View (i==1) each have their own native-window
+        """Sim View (i==0) and Video View (i==2) each have their own native-window
         container for the embedded Unity view (s.unity_container / s.vsat). A Win32
         HWND can only be a child of one parent at a time, so re-parent the real Unity
         window to whichever of the two containers is on screen right now. No-ops until
@@ -530,7 +730,7 @@ class Main(QMainWindow):
         during __init__, before the real-mode attributes below even exist yet."""
         if not getattr(s, 'unity_hwnd', None):
             return
-        target = s.unity_container if i == 0 else (s.vsat if i == 1 else None)
+        target = s.unity_container if i == 0 else (s.vsat if i == 2 else None)
         if target is None or target is s._unity_parent:
             return
         s._unity_parent = target
@@ -542,13 +742,15 @@ class Main(QMainWindow):
         """Qt's QHBoxLayout can leave a stale cached size for a fixed-width sibling (the
         rail) and for word-wrapped QLabels inside it after the sibling has been hidden and
         re-shown via a QStackedWidget switch. Re-maximizing the window used to be the only
-        thing that forced a fresh resize event and fixed it - do the equivalent here instead."""
-        inner = getattr(s, '_rail_inner', s.rail)
+        thing that forced a fresh resize event and fixed it - do the equivalent here instead.
+        Operates on whichever of sim_rail / video_rail is the current page of rail_stack."""
+        cur = s.rail_stack.currentWidget()
+        inner = getattr(cur, 'rail_inner', cur)
         for lab in inner.findChildren(QLabel):
             if lab.wordWrap(): lab.setWordWrap(False); lab.setWordWrap(True)
         lay = inner.layout()
         if lay: lay.invalidate(); lay.activate()
-        inner.updateGeometry(); s.rail.updateGeometry()
+        inner.updateGeometry(); cur.updateGeometry()
         root_lay = s.centralWidget().layout()
         root_lay.invalidate(); root_lay.activate()
         s.centralWidget().updateGeometry()
@@ -563,7 +765,7 @@ class Main(QMainWindow):
         QApplication.instance().setPalette(pal); s.setStyleSheet(qss()); s._lk = None
         for w in s.findChildren(QWidget): w.update()
 
-    def build_rail(s):
+    def build_sim_rail(s):
         f = QFrame(); l = QVBoxLayout(f); l.setContentsMargins(0, 20, 16, 20); l.setSpacing(14)
         s.r = {k: QLabel('-') for k in ('det', 'pan', 'tilt', 'off', 'time', 'fps')}
         s.ls = QLabel('Searching'); s.ls.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -580,12 +782,30 @@ class Main(QMainWindow):
                           kv('Kalman filter', s.pkal), kv('Pan/tilt controller', QLabel('Running'))))
         s.evl = QLabel(''); s.evl.setObjectName('mut'); s.evl.setWordWrap(True); s.evl.setAlignment(Qt.AlignmentFlag.AlignTop); s.evl.setMinimumHeight(120)
         l.addWidget(panel('Events', s.evl)); l.addStretch(); s.fps, s._last = 30.0, 0
-        s._rail_inner = f
-        sc = scroll_wrap(f, h_as_needed=False); sc.setFixedWidth(300); return sc
+        sc = scroll_wrap(f, h_as_needed=False); sc.rail_inner = f; return sc
+
+    def build_video_rail(s):
+        """Right-side panel shown on Video View — distinct from Sim View's rail (gimbal
+        telemetry / Unity pipeline). This one summarizes the imported video source,
+        detector status and playback position instead."""
+        f = QFrame(); l = QVBoxLayout(f); l.setContentsMargins(0, 20, 16, 20); l.setSpacing(14)
+        s.vr = {k: QLabel('-') for k in ('src', 'state', 'speed', 'det', 'off', 'pan', 'tilt', 'time', 'frame', 'mode', 'rmse', 'lock', 'acc', 'loss')}
+        def kv(name, w):
+            r = QWidget(); h = QHBoxLayout(r); h.setContentsMargins(0, 0, 0, 0); a = QLabel(name); a.setObjectName('mut')
+            w.setStyleSheet('font-weight:700'); h.addWidget(a); h.addStretch(); h.addWidget(w); return r
+        for lab in s.vr.values(): lab.setWordWrap(True)
+        l.addWidget(panel('Source', kv('File', s.vr['src']), kv('Playback', s.vr['state']), kv('Speed', s.vr['speed'])))
+        l.addWidget(panel('Detector', kv('Beacon', s.vr['det']), kv('Offset from centre', s.vr['off']),
+                  kv('Pan', s.vr['pan']), kv('Tilt', s.vr['tilt']), kv('Mode', s.vr['mode'])))
+        l.addWidget(panel('Tracking performance', kv('RMSE', s.vr['rmse']), kv('Lock retention', s.vr['lock']),
+                          kv('Accuracy', s.vr['acc']), kv('Target losses', s.vr['loss'])))
+        l.addWidget(panel('Playback position', kv('Elapsed', s.vr['time']), kv('Frame', s.vr['frame'])))
+        l.addStretch()
+        sc = scroll_wrap(f, h_as_needed=False); sc.rail_inner = f; return sc
 
     # ---- Sim View
     def build_sim(s):
-        s.pz = btn('Pause', True, s.toggle_sim); rs = btn('Reset scenario', False, s.sim.reset)
+        s.pz = btn('Start Simulation', True, s.toggle_sim); rs = btn('Reset scenario', False, s.sim.reset)
         s.start_unity_btn = btn('Start Unity', False, s.start_unity)
         hd, _ = header('Live simulation', 'Python tracker driving the Unity gimbal in a closed loop', s.start_unity_btn, s.pz, rs)
 
@@ -603,12 +823,28 @@ class Main(QMainWindow):
         s.sat = s.unity_container  # keep name `s.sat` so the shared tick() loop still finds it
 
         cw = QWidget(); g = QGridLayout(cw); g.setContentsMargins(0, 0, 0, 0); g.setVerticalSpacing(12); g.setColumnStretch(1, 1)
-        s.mt = QComboBox(); s.mt.addItems(['Linear', 'Orbital', 'Mixed']); s.mt.setCurrentText('Mixed')
-        s.mt.currentTextChanged.connect(lambda t: (setattr(s.sim, 'type', t), s.sim.reset()))
-        g.addWidget(QLabel('Satellite movement type'), 0, 0); g.addWidget(s.mt, 0, 1, 1, 2)
-        for i, (k, lab, mx, dv, df) in enumerate(PARAMS, 1):
+        # Test-case scene picker — options are the .txt scene files saved from the
+        # Scene-Parameters tab into SCENES_DIR (see the constant near the top of this
+        # file and refresh_scene_list()), placed first so a scenario can be picked
+        # before touching the other controls. "Load scene" sends the chosen file's
+        # name to backend.TrackingThread.parsed() (load_selected_scene()).
+        tc_row = QWidget(); tc_l = QHBoxLayout(tc_row); tc_l.setContentsMargins(0, 0, 0, 0); tc_l.setSpacing(8)
+        s.test_case = QComboBox(); s.test_case.currentTextChanged.connect(s.on_test_case_changed)
+        s.load_scene_btn = QPushButton('Load scene'); s.load_scene_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        s.load_scene_btn.clicked.connect(s.load_selected_scene)
+        # Small progress bar that fills over ~2.5s as visual feedback while a scene
+        # loads (see _play_load_scene_animation()) — hidden the rest of the time.
+        s.load_progress = QProgressBar(); s.load_progress.setRange(0, 100)
+        s.load_progress.setFixedWidth(110); s.load_progress.setTextVisible(False); s.load_progress.hide()
+        tc_l.addWidget(s.test_case, 1); tc_l.addWidget(s.load_scene_btn); tc_l.addWidget(s.load_progress)
+        s.refresh_scene_list()   # populate the combo now that it exists
+        g.addWidget(QLabel('Test case scene'), 0, 0); g.addWidget(tc_row, 0, 1, 1, 2)
+        s.mt = QComboBox(); s.mt.addItems(['Straight Horizontal', 'Straight Vertical', 'Figure 8', 'Circular', 'Mixed']); s.mt.setCurrentText('Mixed')
+        s.mt.currentTextChanged.connect(s.on_movement_changed)
+        g.addWidget(QLabel('Satellite movement type'), 1, 0); g.addWidget(s.mt, 1, 1, 1, 2)
+        for i, (k, lab, mx, dv, df) in enumerate(PARAMS, 2):
             sl = QSlider(Qt.Orientation.Horizontal); sl.setRange(0, mx); sl.setValue(int(df * dv)); val = QLabel(f"{df:g}")
-            sl.valueChanged.connect(lambda v, k=k, dv=dv, val=val: (s.sim.p.__setitem__(k, v / dv), val.setText(f"{v / dv:g}")))
+            sl.valueChanged.connect(lambda v, k=k, dv=dv, val=val: (s.sim.p.__setitem__(k, v / dv), val.setText(f"{v / dv:g}"),s.slide_change(list(s.sim.p.values()))))
             g.addWidget(QLabel(lab), i, 0); g.addWidget(sl, i, 1); g.addWidget(val, i, 2)
         pw = QWidget(); pg = QGridLayout(pw); pg.setContentsMargins(0, 0, 0, 0); pg.setVerticalSpacing(8); pg.setColumnStretch(0, 1); s.k = []
         for j, (n, tg) in enumerate((('Lock retention', '98.2%'), ('Tracking RMSE', '6.1 px'), ('Acquisition time', '0.73 s'),
@@ -622,15 +858,246 @@ class Main(QMainWindow):
         # fake Sim.err buffer only if real_mode is somehow off.
         s.chart = Chart(lambda: list(s.rt_err_history) if s.real_mode else s.sim.err, 120, 60)
         perf = panel('Tracking performance', pw, QLabel('Graphical view: error over time (px)'), s.chart)
-        w, l = page(hd, row(panel('Python-side view (live)', s.cam), panel('Unity (live, embedded)', s.sat)), row(panel('Scenario controls', cw), perf), stretch=[0, 5, 4]); return w
+        # View-mode picker for the embedded Unity panel — sits on the right of the panel's
+        # title row (not right beside the title text) via panel_with_header_control's stretch.
+        s.sat_view = QComboBox(); s.sat_view.addItems(['Satellite Pov', 'Satellite motion view'])
+        s.sat_view.setFixedWidth(180)
+        s.sat_view.currentTextChanged.connect(s.on_sat_view_changed)
+        s.selected_sat_view = s.sat_view.currentText()
+        unity_panel = panel_with_header_control('Unity (live, embedded)', s.sat_view, s.sat)
+        w, l = page(hd, row(panel('Python-side view (live)', s.cam), unity_panel), row(panel('Scenario controls', cw), perf), stretch=[0, 5, 4]); return w
+
+    def slide_change(s, val):
+        print("sluder was changed:!!!!! and the list: ", val, s.sim.running)
+        tt = getattr(s, 'tracking_thread', None)
+        if tt is None:
+            return
+        else:
+            tt.set_effects(val[:3])
 
     def toggle_sim(s):
-        s.sim.running = not s.sim.running; s.pz.setText('Pause' if s.sim.running else 'Resume')
+        """First press starts the (already-running, already-connected-to-Unity) tracking
+        loop that begins life paused in __init__; every press after that just pauses or
+        resumes it same as before. Deliberately does not touch s.sim.running (the fake
+        fallback demo) — that belongs to Video View's own Pause button (toggle_video),
+        kept fully separate so the two Pause/Resume buttons never affect each other's tab."""
+        tt = getattr(s, 'tracking_thread', None)
+        if tt is None:
+            return
+        if tt.is_paused():
+            tt.resume()
+        else:
+            tt.pause()
+        s.pz.setText('Pause' if not tt.is_paused() else 'Start Simulation')
+
+    def on_movement_changed(s, name):
+        """Satellite movement type combo. Keeps the fake Sim's type/reset as harmless
+        housekeeping (unused visually while real_mode is on), and forwards the selected
+        option straight to backend.TrackingThread.movement_changed(name)."""
+        s.sim.type = name; s.sim.reset()
+        tt = getattr(s, 'tracking_thread', None)
+        if tt is not None:
+            tt.movement_changed(name)
+        s.on_status_changed(f"Satellite movement type: {name}")
+
+    def on_test_case_changed(s, name):
+        """Selecting a scene here just records the choice and logs it — it does not load
+        it into the tracker. The "Load scene" button next to this dropdown is what
+        actually sends it to backend.TrackingThread.parsed() (see load_selected_scene())."""
+        s.selected_test_case = name
+        s.on_status_changed(f"Test case scene selected: {name}")
+
+    def refresh_scene_list(s):
+        """Re-reads SCENES_DIR for .txt scene files and repopulates the Sim View
+        "Test case scene" dropdown with their names (the file names, without the
+        .txt extension). Called when Sim View is first built, again every time
+        Save is pressed on the Scene-Parameters tab, and again whenever the user
+        navigates to Sim View (see go()), so a newly saved scene shows up without
+        restarting the app. Keeps the current selection if it still exists."""
+        try:
+            names = sorted(os.path.splitext(os.path.basename(p))[0]
+                            for p in glob.glob(os.path.join(SCENES_DIR, '*.txt')))
+        except OSError:
+            names = []
+        if not hasattr(s, 'test_case'):
+            return
+        current = s.test_case.currentText()
+        s.test_case.blockSignals(True)
+        s.test_case.clear(); s.test_case.addItems(names)
+        if current in names: s.test_case.setCurrentText(current)
+        s.test_case.blockSignals(False)
+        s.selected_test_case = s.test_case.currentText()
+
+    def load_selected_scene(s):
+        """"Load scene" button beside the Test case scene dropdown. Passes the
+        selected scene's file name (without the .txt extension, exactly as shown
+        in the dropdown) to backend.TrackingThread.parsed(), which is expected to
+        read that file back out of SCENES_DIR and apply it."""
+        name = s.test_case.currentText()
+        if not name:
+            QMessageBox.warning(s, 'Sim View', f'No scene files found in:\n{SCENES_DIR}')
+            return
+        try:
+            s.tracking_thread.parsed(name)
+            s.on_status_changed(f"Loaded scene: {name}")
+        except Exception as e:
+            QMessageBox.warning(s, 'Sim View', f'Could not load scene "{name}": {e}')
+            return
+        s._play_load_scene_animation()
+
+    def _play_load_scene_animation(s):
+        """~2.5s progress-bar fill next to the Load scene button, purely visual
+        feedback that a scene just loaded. The button is disabled for the duration
+        so a second click can't stack another animation on top of this one."""
+        s.load_scene_btn.setEnabled(False)
+        s.load_progress.setValue(0); s.load_progress.show()
+        anim = QPropertyAnimation(s.load_progress, b'value', s)
+        anim.setDuration(2500); anim.setStartValue(0); anim.setEndValue(100)
+        anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+
+        def _finish():
+            s.load_progress.hide(); s.load_scene_btn.setEnabled(True)
+
+        anim.finished.connect(_finish)
+        s._load_scene_anim = anim   # keep a reference — an unparented QPropertyAnimation
+        anim.start()                # can get garbage-collected mid-animation otherwise
+
+    def on_sat_view_changed(s, name):
+        """Switching between 'Satellite Pov' and 'Satellite motion view' logs the choice
+        and calls the matching TrackingThread method right away (this combo only lives on
+        Sim View, so the user is necessarily on that tab when it fires)."""
+        s.selected_sat_view = name
+        s.on_status_changed(f"Unity view mode selected: {name}")
+        s._invoke_sat_view(name)
+
+    def _invoke_sat_view(s, name):
+        """Calls backend.TrackingThread.sat_pov() for 'Satellite Pov', or .second_view()
+        for 'Satellite motion view' (and as the fallback for any other value)."""
+        tt = getattr(s, 'tracking_thread', None)
+        if tt is None:
+            return
+        if name == 'Satellite Pov':
+            tt.sat_pov()
+        else:
+            tt.second_view()
+
+    # ============================================================
+    # SCENE-PARAMETERS LAYOUT (Figma: Beacon Settings / Satellite Settings /
+    # Disturbances / Camera Settings, 2x2 grid of panels).
+    #
+    # Every panel's rows live in ONE scene_grid() per panel (builders defined
+    # near panel()/row(), under "Scene-Parameters builders") so labels and
+    # controls line up down the whole panel instead of each row picking its own
+    # spacing. To add/remove/rename a control, edit the grid_full(...)/
+    # grid_half(...) calls below; each one also registers its widget in
+    # s.scene_widgets so Save picks up new controls automatically. Camera
+    # Settings has no controls yet per spec — its panel is just a placeholder.
+    # ============================================================
+    def build_scene_params(s):
+        save_btn = btn('Save', False, s.save_scene_settings)
+        s.scene_filename = QLineEdit(); s.scene_filename.setPlaceholderText('File name')
+        s.scene_filename.setText('scene_settings1'); s.scene_filename.setFixedWidth(160)
+        hd, _ = header('Scene parameters', 'Configure the simulated scene before running Sim View.',
+                       s.scene_filename, save_btn)
+
+        s.scene_widgets = {}   # {panel title: {control label: widget}} — read back by save_scene_settings()
+        def reg(group, label, widget):
+            s.scene_widgets.setdefault(group, {})[label] = widget
+            return widget
+
+        # ---- Beacon Settings: paired grid (label|control|label|control) so the
+        # two half-width rows (Colour+Blink, Shape+Size) line up with each other
+        # and with the two full-width rows (Start Position, Movement Type).
+        G = 'Beacon Settings'
+        bw, bg = scene_grid(paired=True)
+        grid_full(bg, 0, 'Start Position', reg(G, 'Start Position',
+            mk_combo(['Random', 'Center', 'Top-Left', 'Top-Right', 'Bottom-Left', 'Bottom-Right', 'Custom'])))
+        grid_half(bg, 1, 0, 'Colour', reg(G, 'Colour', mk_combo(['Red', 'Green', 'Blue', 'White', 'Yellow', 'Orange'])))
+        grid_half(bg, 1, 1, 'Blink', reg(G, 'Blink', mk_toggle(True)))
+        grid_half(bg, 2, 0, 'Shape', reg(G, 'Shape', mk_combo(['Circle', 'Square', 'Triangle', 'Cross'])))
+        grid_half(bg, 2, 1, 'Size', reg(G, 'Size', mk_combo(['2px', '4px', '6px', '8px', '10px', '12px'])))
+        grid_full(bg, 3, 'Movement Type', reg(G, 'Movement Type', mk_combo(['Straight Horizontal', 'Straight Vertical', 'Figure 8', 'Circular', 'Mixed', 'Random'])))
+        beacon_panel = panel_top('Beacon Settings', 'beacon', bw)
+
+        # ---- Satellite Settings: single-column grid, every control fills the
+        # full remaining row width.
+        G = 'Satellite Settings'
+        sw, sg = scene_grid()
+        dist_row, dist_sl = mk_slider(0, 300, 100)
+        grid_full(sg, 0, 'Distance from beacon', dist_row); reg(G, 'Distance from beacon', dist_sl)
+        grid_full(sg, 1, 'No. Of Beacons', reg(G, 'No. Of Beacons', mk_combo(['1', '2', '3', '4', '5'])))
+        grid_full(sg, 2, 'Extra Beacon Position', reg(G, 'Extra Beacon Position', mk_combo(['Random', 'Fixed'])))
+        grid_full(sg, 3, 'Satellite Position', reg(G, 'Satellite Position', mk_combo(['Random', 'Fixed'])))
+        grid_full(sg, 4, 'Satellite Rotation', reg(G, 'Satellite Rotation', mk_combo(['Random', 'Fixed'])))
+        satellite_panel = panel_top('Satellite Settings', 'satellite', sw)
+
+        # ---- Disturbances: single-column grid of slider rows, all the same
+        # height, so they sit evenly spaced instead of one row stretching to
+        # fill whatever height the panel ends up with.
+        G = 'Disturbances'
+        dw, dg = scene_grid()
+        # Noise/Blur/Atmospheric Disturbance: raw slider steps 0-100 with divisor=100
+        # display as 0.00-1.00 in 0.01 increments (one slider step = 0.01), matching
+        # the same 0-100/divisor-100/default-0 pattern Sim View's own Scenario controls
+        # sliders already use for these same three (see PARAMS near the top of this file).
+        for i, (label, mn, mx, default_raw, dv) in enumerate((
+            ('Noise Level', 0, 100, 0, 100), ('Blur Level', 0, 100, 0, 100), ('Atmospheric Disturbance', 0, 100, 0, 100),
+            ('Max Standard Deviation (px)', 0, 20, 5, 1), ('Max Camera Jitter (px)', 0, 20, 3, 1), ('Platform Motion', 0, 10, 1, 1),
+        )):
+            row_w, sl = mk_slider(mn, mx, default_raw, divisor=dv)
+            grid_full(dg, i, label, row_w); reg(G, label, sl)
+        disturbances_panel = panel_top('Disturbances', 'disturbance', dw)
+
+        # ---- Camera Settings (not decided yet — left empty per spec)
+        cam_placeholder = QLabel('Not decided yet.'); cam_placeholder.setObjectName('mut')
+        cam_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        camera_panel = panel_top('Camera Settings', 'camera', cam_placeholder)
+        s.scene_widgets.setdefault('Camera Settings', {})   # empty group, still appears in the saved file
+
+        w, l = page(hd, row(beacon_panel, satellite_panel), row(disturbances_panel, camera_panel), stretch=[0, 1, 1])
+        return w
+
+    def save_scene_settings(s):
+        """Save button on the Scene-Parameters tab. Reads every control currently
+        registered in s.scene_widgets (built in build_scene_params(), grouped by
+        panel) and writes them to <file name field>.txt inside SCENES_DIR (see the
+        constant near the top of this file), one 'Label: value' line per control
+        under its panel's name. The file name comes from the text field beside
+        Save (defaults to 'scene_settings1' if left blank); '.txt' is appended
+        automatically if not typed. Overwrites the file on every click. Also
+        refreshes the Sim View "Test case scene" dropdown so a newly saved scene
+        shows up there immediately."""
+        def value_of(w):
+            if isinstance(w, QComboBox): return w.currentText()
+            if isinstance(w, QSlider):
+                dv = w.property('divisor') or 1
+                return f"{w.value() / dv:g}"
+            if isinstance(w, QPushButton) and w.isCheckable(): return 'ON' if w.isChecked() else 'OFF'
+            return ''
+        lines = []
+        for group, fields in s.scene_widgets.items():
+            lines.append(f"{group}:")
+            if not fields:
+                lines.append("  (not configured yet)")
+            for label, widget in fields.items():
+                lines.append(f"  {label}: {value_of(widget)}")
+            lines.append("")
+        name = s.scene_filename.text().strip() or 'scene_settings1'
+        if not name.lower().endswith('.txt'): name += '.txt'
+        path = os.path.join(SCENES_DIR, name)
+        try:
+            os.makedirs(SCENES_DIR, exist_ok=True)
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines).rstrip() + '\n')
+            s.refresh_scene_list()
+            QMessageBox.information(s, 'Scene parameters', f'Saved to {path}')
+        except Exception as e:
+            QMessageBox.warning(s, 'Scene parameters', f'Could not save settings: {e}')
 
     # ---- Video View
     def build_video(s):
-        hd, s.vsub = header('Video view', 'Demo feed. Import an MP4 to run detection on your own footage.')
-        v = s.video; s.vcam = CamView(s.sim, v)
+        hd, s.vsub = header('Video view', 'Import an MP4 to run beacon detection on your own footage.')
+        v = s.video; s.vcam = CamView(v)
         # Real Unity view container (replaces the old painted SatView fake scene). This is
         # a plain native-window widget, exactly like s.unity_container on Sim View — the
         # real Unity HWND gets re-parented into whichever of the two is visible, via
@@ -641,27 +1108,87 @@ class Main(QMainWindow):
         s.vsat.setMinimumSize(230, 140)
         s.path = QLineEdit(); s.path.setReadOnly(True); s.path.setPlaceholderText('File location')
         top = QWidget(); tl = QHBoxLayout(top); tl.setContentsMargins(0, 0, 0, 0); tl.addWidget(btn('Import MP4', False, s.import_video)); tl.addWidget(s.path)
-        s.vp = btn('Pause', False, s.toggle_video); s.scrub = QSlider(Qt.Orientation.Horizontal); s.scrub.setRange(0, 1000)
-        s.scrub.sliderMoved.connect(s.seek); s.tm = QLabel('0s'); s.spd = QComboBox(); s.spd.addItems(['0.5x', '1x', '2x']); s.spd.setCurrentIndex(1)
-        s.spd.currentIndexChanged.connect(lambda i: setattr(s, 'speed', (.5, 1, 2)[i]))
+        s.vp = btn('Pause', False, s.toggle_video); s.vp.setEnabled(False); s.scrub = QSlider(Qt.Orientation.Horizontal); s.scrub.setRange(0, 1000)
+        s.scrub.sliderMoved.connect(s.seek); s.tm = QLabel('0s'); s.spd = QComboBox(); s.spd.addItems(['0.25x', '0.5x', '1x', '2x', '4x']); s.spd.setCurrentIndex(2)
+        s.spd.currentIndexChanged.connect(s.on_speed_changed)
         ctl = QWidget(); cl = QHBoxLayout(ctl); cl.setContentsMargins(0, 0, 0, 0)
         for x in (s.vp, s.scrub, s.tm, s.spd): cl.addWidget(x)
         src = QWidget(); sl = QVBoxLayout(src); sl.setContentsMargins(0, 0, 0, 0); sl.addWidget(top); sl.addWidget(QLabel('Video controls')); sl.addWidget(ctl)
-        s.dt = table(['Time', 'X offset', 'Y offset', 'State'], 5); s.vchart = Chart(lambda: v.err if v.active else s.sim.err, 150)
-        w, l = page(hd, row(panel('Python-side overview', s.vcam), panel('3D camera pan/tilt', s.vsat)),
+        s.dt = table(['Time', 'X offset', 'Y offset', 'State'], 5); s.vchart = Chart(lambda: v.err, 150, auto=True)
+        s.vview = QComboBox(); s.vview.addItems(['Python side view', 'Video View']); s.vview.currentIndexChanged.connect(s.on_vview_changed)
+        w, l = page(hd, row(panel_with_header_control('Python-side overview', s.vview, s.vcam), panel('3D camera pan/tilt', s.vsat)),
                     row(panel('Source', src), panel('Latest detections', s.dt)), panel('Beacon offset from centre (px)', s.vchart), stretch=[0, 5, 3, 2]); return w
 
     def import_video(s):
-        if cv2 is None: return QMessageBox.warning(s, 'OpenCV missing', 'Install it with:  pip install opencv-python')
         p, _ = QFileDialog.getOpenFileName(s, 'Import video', '', 'Video (*.mp4 *.avi *.mov *.mkv)')
-        if p and s.video.open(p): s.path.setText(p); s.vsub.setText('Threshold and centroid detection running on the imported video.'); s.vp.setText('Pause')
+        if not p: return
+        probe = cv2.VideoCapture(p); ok = probe.isOpened(); probe.release()
+        if not ok: return QMessageBox.warning(s, 'Import video', 'Could not open that video file.')
+        s.stop_video()
+        v = s.video; v.reset(); v.active = True; v.paused = False
+        w = VideoWorker(p); w.speed = s.speed
+        w.result.connect(s.on_video_result); w.status.connect(s.on_video_status)
+        w.failed.connect(s.on_video_failed); w.ended.connect(s.on_video_ended)
+        v.worker = w; w.start()
+        s.path.setText(p); s.vsub.setText('Loading YOLO model...'); s.vp.setText('Pause'); s.vp.setEnabled(True); s.scrub.setValue(0)
+
+    def stop_video(s):
+        """Stop the video + detection thread and close the OpenCV preview window."""
+        v = s.video; w = v.worker
+        if w is not None:
+            w.stop(); w.wait(); v.worker = None
+        v.active = False
 
     def toggle_video(s):
-        if s.video.active: s.video.paused = not s.video.paused; s.vp.setText('Play' if s.video.paused else 'Pause')
-        else: s.toggle_sim(); s.vp.setText('Play' if not s.sim.running else 'Pause')
+        """Pause/resume Video View ONLY. Pause stops both the MP4 playback and the beacon
+        detection; Play resumes both. Deliberately does not touch tracking_thread — that
+        belongs to Sim View's own Pause button (toggle_sim), kept fully separate."""
+        v = s.video
+        if not v.active or v.worker is None: return
+        v.paused = not v.paused
+        if v.paused: v.worker.pause()
+        else: v.worker.play()
+        s.vp.setText('Play' if v.paused else 'Pause')
 
     def seek(s, val):
-        if s.video.active: s.video.cap.set(cv2.CAP_PROP_POS_FRAMES, val / 1000 * s.video.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        # detection restarts (re-acquires) from the new position
+        if s.video.worker is not None: s.video.worker.seek_to(val / 1000)
+
+    def on_vview_changed(s, i):
+        s.vcam.mode = 'raw' if i == 1 else 'py'; s.vcam.update()
+
+    def on_speed_changed(s, i):
+        s.speed = (.25, .5, 1, 2, 4)[i]
+        # VideoWorker.run() paces frames with `next_t += 1 / (fps * s.speed)` (see near
+        # the top of this file), so this actually changes how fast the video plays and
+        # is detected — it is not just a label change in the UI.
+        if s.video.worker is not None: s.video.worker.speed = s.speed
+
+    def on_video_result(s, img, raw, info):
+        v = s.video
+        if s.sender() is not v.worker: return            # late frame from a replaced worker
+        v.update(img, raw, info)
+        # Feed the Video View's own pan/tilt (from BeaconTracker, independent of Sim View's
+        # TrackingThread loop) into backend.TrackingThread for as long as this video plays.
+        tt = getattr(s, 'tracking_thread', None)
+        if tt is not None and hasattr(tt, 'placehold'):
+            tt.placehold([float(info['pan']), float(info['tilt'])])
+        if not s.scrub.isSliderDown():
+            s.scrub.blockSignals(True); s.scrub.setValue(int(1000 * info['pos_frac'])); s.scrub.blockSignals(False)
+
+    def on_video_status(s, text):
+        if s.sender() is s.video.worker: s.vsub.setText(text)
+
+    def on_video_failed(s, text):
+        if s.sender() is not s.video.worker: return
+        s.stop_video(); s.video.reset(); s.vp.setEnabled(False); s.vp.setText('Pause'); s.path.clear()
+        s.vsub.setText('Import an MP4 to run beacon detection on your own footage.')
+        QMessageBox.warning(s, 'Video detection', text)
+
+    def on_video_ended(s, msg):
+        if s.sender() is not s.video.worker: return
+        s.video.paused = True; s.vp.setText('Play'); s.vsub.setText(f'Video finished. {msg}. Press Play to run it again.')
+        print(msg)
 
     # ---- Benchmark
     def build_bench(s):
@@ -703,10 +1230,10 @@ class Main(QMainWindow):
     def build_data(s):
         hd, _ = header('Data-Check', 'Saved benchmarks, spec compliance and trends across runs')
         s.bl = QListWidget(); s.bl.currentRowChanged.connect(lambda i: i >= 0 and (setattr(s, 'sel', i), s.draw_details()))
-        left = QWidget(); ll = QVBoxLayout(left); ll.setContentsMargins(0, 0, 0, 0); ll.addWidget(btn('Add benchmark', False, lambda: s.go(2))); ll.addWidget(s.bl)
+        left = QWidget(); ll = QVBoxLayout(left); ll.setContentsMargins(0, 0, 0, 0); ll.addWidget(btn('Add benchmark', False, lambda: s.go(3))); ll.addWidget(s.bl)
         s.dn = QLabel(); s.dn.setObjectName('h3'); s.dmeta = QLabel(); s.dmeta.setObjectName('mut'); s.kpi = QLabel(); s.kpi.setTextFormat(Qt.TextFormat.RichText)
         s.dtab = table(['Scenario'])
-        vb = btn('View in Video tab', True, lambda: (s.go(1), s.vsub.setText(f"Reviewing benchmark: {s.bench[s.sel]['name']}. Import its MP4 to replay.")))
+        vb = btn('View in Video tab', True, lambda: (s.go(2), s.vsub.setText(f"Reviewing benchmark: {s.bench[s.sel]['name']}. Import its MP4 to replay.")))
         right = QWidget(); rl = QVBoxLayout(right); rl.setContentsMargins(0, 0, 0, 0); tr = QHBoxLayout(); tr.addWidget(s.dn); tr.addStretch(); tr.addWidget(vb)
         rl.addLayout(tr); rl.addWidget(s.dmeta); rl.addWidget(s.kpi); rl.addWidget(s.dtab, 1)
         # criterion picker + per-scenario bar chart (this benchmark) + trend chart (across all saved benchmarks)
@@ -798,12 +1325,8 @@ class Main(QMainWindow):
         if m.running:
             s.acc += s.speed
             while s.acc >= 1: m.step(); s.acc -= 1
-        if v.active and not v.paused:
-            s.vacc += s.speed
-            while s.vacc >= 1: v.read(); s.vacc -= 1
-            if v.cap: s.scrub.blockSignals(True); s.scrub.setValue(int(1000 * v.cap.get(cv2.CAP_PROP_POS_FRAMES) / max(1, v.cap.get(cv2.CAP_PROP_FRAME_COUNT)))); s.scrub.blockSignals(False)
         i = s.stack.currentIndex()
-        if i > 1: return
+        if i not in (0, 2): return
         for w in (s.cam, s.sat, s.chart) if i == 0 else (s.vcam, s.vsat, s.vchart): w.update()
         if i == 0:
             if s.real_mode:
@@ -814,11 +1337,12 @@ class Main(QMainWindow):
                 acq = m.acq_avg
                 for lab, txt in zip(s.k, (f"{m.retention:.1f}%", f"{m.rmse:.1f} px", f"{acq:.2f} s" if acq is not None else '-', f"{m.loss_pct:.1f}%", f"{m.accuracy:.1f}%")): lab.setText(txt)
         else:
-            s.tm.setText(f"{(v.t if v.active else m.t):.0f}s")
-            rows = v.rows if v.active else [(f"{m.t:.1f}s", f"{m.mx:.0f}", f"{m.my:.0f}", 'Beacon found' if m.det else 'Not found')]
+            s.tm.setText(f"{v.t:.0f}s")
+            rows = v.rows
             s.dt.setRowCount(len(rows))
             for r, vals in enumerate(rows):
                 for c, t in enumerate(vals): s.dt.setItem(r, c, QTableWidgetItem(t))
+            s.update_video_rail()
         if not s.real_mode:
             if s._lk != m.lock:
                 s._lk = m.lock; s.ls.setText('LOCKED' if m.lock else 'SEARCHING')
@@ -850,6 +1374,24 @@ class Main(QMainWindow):
             f"{acc:.1f}%",
         )
         for lab, txt in zip(s.k, vals): lab.setText(txt)
+
+    def update_video_rail(s):
+        """Fills the Video View side panel (s.vr labels) from the imported MP4's detector output."""
+        v, i = s.video, s.video.info
+        vals = dict.fromkeys(('state', 'det', 'off', 'pan', 'tilt', 'time', 'frame', 'mode', 'rmse', 'lock', 'acc', 'loss'), '-')
+        vals['src'] = 'No video imported'
+        if v.active:
+            vals['src'] = s.path.text() or '-'
+            vals['state'] = 'Paused' if v.paused else 'Playing'
+            if i:
+                bo = i['beacon_offset']
+                vals.update(det='Detected' if v.det else 'Not found', off=f"{bo[0]:.1f}, {bo[1]:.1f}" if bo else '-',
+                            pan=f"{i['pan']:.2f}°", tilt=f"{i['tilt']:.2f}°",
+                            time=f"{v.t:.1f} s", frame=f"{i['frame_index']}/{i['total']}" if i['total'] else f"{i['frame_index']}",
+                            mode=i['status'].title(), rmse=f"{i['rmse']:.1f} px", lock=f"{i['lock_retention']:.1f}%",
+                            acc=f"{i['accuracy']:.1f}%", loss=str(i['target_loss_count']))
+        for k, t in vals.items(): s.vr[k].setText(t)
+        s.vr['speed'].setText(f"{s.speed:g}x")
 
     def on_frame_ready(s, frame):
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -925,9 +1467,23 @@ class Main(QMainWindow):
         s.start_unity_btn.setText('Starting Unity...')
         s.punity.setText('Starting...')
 
-        s.unity_proc = subprocess.Popen(
-            [UNITY_EXE, "-popupwindow", "-screen-fullscreen", "0"]
-        )
+        try:
+            s.unity_proc = subprocess.Popen(
+                [UNITY_EXE, "-popupwindow", "-screen-fullscreen", "0"]
+            )
+        except OSError as e:
+            # e.g. FileNotFoundError when UNITY_EXE doesn't point to a real file —
+            # fail loudly in the UI instead of raising out of a QTimer callback,
+            # which would otherwise leave the button stuck disabled/mid-text.
+            s.unity_proc = None
+            s.start_unity_btn.setEnabled(True)
+            s.start_unity_btn.setText('Start Unity')
+            s.punity.setText('Not found')
+            s.on_status_changed(f"Could not launch Unity: {e}")
+            QMessageBox.warning(s, 'Start Unity',
+                                 f"Could not launch Unity at:\n{UNITY_EXE}\n\n{e}")
+            return
+
         QTimer.singleShot(800, s.find_and_embed_unity)
 
     def find_unity_hwnd_by_pid(s, pid):
@@ -1022,6 +1578,7 @@ class Main(QMainWindow):
         s.resize_unity_window()
 
     def closeEvent(s, event):
+        s.stop_video()
         s.tracking_thread.stop()
         s.tracking_thread.wait(2000)
         if s.unity_proc:

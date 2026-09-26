@@ -6,6 +6,8 @@ using System.Globalization;
 public class CameraStreamer : MonoBehaviour
 {
     public TrackingMetrics trackingMetrics;
+    public MasterControl masterControl;
+    public VideoGimbalController videoGimbalController;
 
     public float panGain = 0.05f;
     public float tiltGain = 0.05f;
@@ -15,8 +17,11 @@ public class CameraStreamer : MonoBehaviour
 
     public Camera cam;
     public Camera externalCamera;
+    public Camera thirdCamera;
     public UiManager uiManager;
     public SpaceMovement spaceMovement;
+    public SearchPattern searchPattern;
+    public SceneConfiguration sceneConfiguration;
 
     public int width = 640;
     public int height = 480;
@@ -279,10 +284,61 @@ public class CameraStreamer : MonoBehaviour
     // PROCESS PYTHON MESSAGE
     // ============================================================
 
-    void ProcessCoordinates(
-        string message
-    )
+    void ProcessCoordinates(string message)
     {
+        Debug.Log(
+            "RECEIVED FROM PYTHON: " + message
+        );
+
+        // rest of your existing code...
+
+        // ========================================================
+        // SCENE CONFIGURATION (JSON)
+        //
+        // Python prefixes scene messages with a raw byte value
+        // of 3 (see backend.py send_scene(): bytes([3]) + json),
+        // followed by the JSON payload and a trailing "\n".
+        //
+        // Because that leading byte gets pulled into the same
+        // UTF8 text buffer as every other message, it survives
+        // here as the literal character (char)3 at position 0 of
+        // "message". Detect it, strip it off, and forward the
+        // remaining JSON straight to SceneConfiguration so the
+        // beacon/satellite/disturbance effects get applied.
+        // ========================================================
+
+        if (
+            message.Length > 0
+            &&
+            message[0] == (char)3
+        )
+        {
+            string sceneJson =
+                message.Substring(1);
+
+            Debug.Log(
+                "SCENE JSON RECEIVED: " + sceneJson
+            );
+
+            if (sceneConfiguration != null)
+            {
+                sceneConfiguration.ApplyScene(
+                    sceneJson
+                );
+            }
+            else
+            {
+                Debug.LogWarning(
+                    "CameraStreamer: sceneConfiguration "
+                    + "reference is not assigned in the "
+                    + "Inspector, so the scene JSON could "
+                    + "not be applied."
+                );
+            }
+
+            return;
+        }
+
         // ========================================================
         // PAUSE COMMAND
         // ========================================================
@@ -303,25 +359,93 @@ public class CameraStreamer : MonoBehaviour
             return;
         }
 
+
+        // ========================================================
+        // SEARCH START
+        // ========================================================
+
+        if (message == "SEARCH_START")
+        {
+            if (searchPattern != null)
+            {
+                searchPattern.StartSearch();
+            }
+
+            return;
+        }
+
+        // ========================================================
+        // SEARCH STOP
+        // ========================================================
+
+        if (message == "SEARCH_STOP")
+        {
+            if (searchPattern != null)
+            {
+                searchPattern.StopSearch();
+            }
+
+            return;
+        }
+
         // ========================================================
         // DISPLAY CHANGE
         // ========================================================
 
         if (message == "SAT_POV")
         {
+            masterControl.SwitchToSimulation();
+            Debug.Log("here...............................");
             cam.targetDisplay = 0;
             externalCamera.targetDisplay = 1;
+            thirdCamera.targetDisplay = 2;
 
             return;
         }
 
         if (message == "SECOND_VIEW")
         {
+            masterControl.SwitchToSimulation();
+            Debug.Log("here...............................");
             cam.targetDisplay = 1;
+            thirdCamera.targetDisplay = 2;
             externalCamera.targetDisplay = 0;
 
             return;
         }
+
+        if (message == "THIRD_VIEW")
+        {
+            masterControl.SwitchToVideo();
+            thirdCamera.targetDisplay = 0;
+            cam.targetDisplay = 1;
+            externalCamera.targetDisplay = 2;
+
+            return;
+        }
+
+        if (message.StartsWith("PANTILT,"))
+        {
+            string[] val = message.Split(',');
+
+            if (val.Length != 3)
+                return;
+
+            if (
+                float.TryParse(val[1], NumberStyles.Float, CultureInfo.InvariantCulture, out float pan)
+                &&
+                float.TryParse(val[2], NumberStyles.Float, CultureInfo.InvariantCulture, out float tilt)
+            )
+            {
+                if (videoGimbalController != null)
+                {
+                    videoGimbalController.SetPanTilt(pan, tilt);
+                }
+            }
+
+            return;
+        }
+
 
         // ========================================================
         // CAMERA EFFECTS
@@ -541,6 +665,9 @@ public class CameraStreamer : MonoBehaviour
         float errorY
     )
     {
+        Debug.Log(
+            $"MOVING CAMERA | error=({errorX:F1},{errorY:F1})"
+        );
         // --------------------------------------------------------
         // Dead zone
         // --------------------------------------------------------

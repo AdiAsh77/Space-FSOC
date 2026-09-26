@@ -20,8 +20,8 @@ public class SpaceMovement : MonoBehaviour
     [Range(0f, 1f)]
     public float turbulenceStrength = 0f;
 
-    public float minTurbulenceChangeTime = 5f;
-    public float maxTurbulenceChangeTime = 10f;
+    public float turbulenceSpeed = 2f;
+    public float turbulenceChangeTime = 1.5f;
 
     private float currentAngle = 0f;
     private int rotationDirection = 1;
@@ -30,7 +30,6 @@ public class SpaceMovement : MonoBehaviour
     private Vector3 targetTurbulenceDirection = Vector3.zero;
 
     private float turbulenceTimer = 0f;
-    private float nextTurbulenceChange = 5f;
 
 
     private void Start()
@@ -114,7 +113,6 @@ public class SpaceMovement : MonoBehaviour
 
     void UpdateTurbulence()
     {
-        // No turbulence
         if (turbulenceStrength <= 0f)
         {
             turbulenceDirection = Vector3.zero;
@@ -125,20 +123,20 @@ public class SpaceMovement : MonoBehaviour
 
         turbulenceTimer += Time.deltaTime;
 
-        // Time to choose a new direction
-        if (turbulenceTimer >= nextTurbulenceChange)
+        // Choose a new random direction
+        if (turbulenceTimer >= turbulenceChangeTime)
         {
             turbulenceTimer = 0f;
 
             ChooseNewTurbulenceDirection();
         }
 
-        // Smoothly change towards new direction
+        // Move smoothly toward the new direction
         turbulenceDirection =
             Vector3.Lerp(
                 turbulenceDirection,
                 targetTurbulenceDirection,
-                Time.deltaTime * 0.5f
+                Time.deltaTime * turbulenceSpeed
             );
     }
 
@@ -146,13 +144,7 @@ public class SpaceMovement : MonoBehaviour
     void ChooseNewTurbulenceDirection()
     {
         targetTurbulenceDirection =
-            Random.onUnitSphere;
-
-        nextTurbulenceChange =
-            Random.Range(
-                minTurbulenceChangeTime,
-                maxTurbulenceChangeTime
-            );
+            Random.insideUnitSphere.normalized;
     }
 
 
