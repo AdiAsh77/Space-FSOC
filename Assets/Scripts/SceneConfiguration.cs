@@ -14,6 +14,9 @@ public class SceneConfiguration : MonoBehaviour
 
     public UiManager uiManager;
 
+    // Tracking Camera / Main Camera
+    public Camera trackingCamera;
+
 
     // ============================================================
     // APPLY SCENE JSON
@@ -26,13 +29,11 @@ public class SceneConfiguration : MonoBehaviour
         Debug.Log(json);
         Debug.Log("================================");
 
-
         SceneData scene;
 
         try
         {
-            scene =
-                JsonUtility.FromJson<SceneData>(json);
+            scene = JsonUtility.FromJson<SceneData>(json);
         }
         catch (System.Exception e)
         {
@@ -46,25 +47,25 @@ public class SceneConfiguration : MonoBehaviour
 
 
         // ========================================================
-        // BEACON
-        // ========================================================
-
-        if (scene.beacon != null)
-        {
-            ApplyBeaconSettings(
-                scene.beacon
-            );
-        }
-
-
-        // ========================================================
-        // SATELLITE
+        // SATELLITE FIRST
         // ========================================================
 
         if (scene.satellite != null)
         {
             ApplySatelliteSettings(
                 scene.satellite
+            );
+        }
+
+
+        // ========================================================
+        // BEACON SECOND
+        // ========================================================
+
+        if (scene.beacon != null)
+        {
+            ApplyBeaconSettings(
+                scene.beacon
             );
         }
 
@@ -91,22 +92,102 @@ public class SceneConfiguration : MonoBehaviour
     // BEACON SETTINGS
     // ============================================================
 
-    void ApplyBeaconSettings(
-        BeaconSettings settings
-    )
+    void ApplyBeaconSettings(BeaconSettings settings)
     {
-        // --------------------------------------------------------
-        // Start Position
-        // --------------------------------------------------------
-
+        string startPosition = settings.start_position;
         if (beacon != null)
         {
-            if (
-                settings.start_position
-                == "Out of Pov"
-            )
+
+
+            // ----------------------------------------------------
+            // RANDOM
+            // ----------------------------------------------------
+
+            if (startPosition == "Random")
+            {
+                string[] positions =
+                {
+                    "Out of Fov",
+                    "Center",
+                    "Top-Left",
+                    "Top-Right",
+                    "Bottom-Left",
+                    "Bottom-Right"
+                };
+
+                int randomIndex =
+                    Random.Range(
+                        0,
+                        positions.Length
+                    );
+
+                startPosition =
+                    positions[randomIndex];
+
+                Debug.Log(
+                    "Random start position selected: "
+                    + startPosition
+                );
+            }
+
+
+            // ----------------------------------------------------
+            // POSITION BEACON
+            // ----------------------------------------------------
+
+            if (startPosition == "Out of Fov")
             {
                 MoveBeaconOutOfView();
+            }
+            else if (startPosition == "Center")
+            {
+                MoveBeaconToFovPosition(
+                    0.5f,
+                    0.5f
+                );
+            }
+            else if (startPosition == "Top-Left")
+            {
+                MoveBeaconToRandomFovArea(
+                    0f,
+                    0.5f,
+                    0.5f,
+                    1f
+                );
+            }
+            else if (startPosition == "Top-Right")
+            {
+                MoveBeaconToRandomFovArea(
+                    0.5f,
+                    1f,
+                    0.5f,
+                    1f
+                );
+            }
+            else if (startPosition == "Bottom-Left")
+            {
+                MoveBeaconToRandomFovArea(
+                    0f,
+                    0.5f,
+                    0f,
+                    0.5f
+                );
+            }
+            else if (startPosition == "Bottom-Right")
+            {
+                MoveBeaconToRandomFovArea(
+                    0.5f,
+                    1f,
+                    0f,
+                    0.5f
+                );
+            }
+            else
+            {
+                Debug.LogWarning(
+                    "Unknown beacon start position: "
+                    + startPosition
+                );
             }
         }
 
@@ -126,9 +207,204 @@ public class SceneConfiguration : MonoBehaviour
         Debug.Log(
             "Beacon | "
             + "Start Position: "
-            + settings.start_position
+            + startPosition
             + " | Movement: "
             + settings.movement_type
+        );
+    }
+
+
+    // ============================================================
+    // MOVE BEACON TO FOV POSITION
+    //
+    // viewportX:
+    // 0 = left
+    // 1 = right
+    //
+    // viewportY:
+    // 0 = bottom
+    // 1 = top
+    // ============================================================
+
+    void MoveBeaconToFovPosition(
+        float viewportX,
+        float viewportY
+    )
+    {
+        if (beacon == null)
+            return;
+
+        if (trackingCamera == null)
+        {
+            trackingCamera =
+                Camera.main;
+        }
+
+        if (trackingCamera == null)
+        {
+            Debug.LogError(
+                "Tracking Camera not assigned!"
+            );
+
+            return;
+        }
+
+
+        // --------------------------------------------------------
+        // Distance from camera
+        // --------------------------------------------------------
+
+        float distance =
+            GetBeaconDistance();
+
+
+        // --------------------------------------------------------
+        // Convert viewport position to world position
+        // --------------------------------------------------------
+
+        Vector3 viewportPosition =
+            new Vector3(
+                viewportX,
+                viewportY,
+                distance
+            );
+
+        Vector3 worldPosition =
+            trackingCamera.ViewportToWorldPoint(
+                viewportPosition
+            );
+
+
+        beacon.transform.position =
+            worldPosition;
+
+
+        Debug.Log(
+            "Beacon moved to FOV position | "
+            + "Viewport: ("
+            + viewportX
+            + ", "
+            + viewportY
+            + ")"
+        );
+    }
+
+
+    // ============================================================
+    // MOVE BEACON TO RANDOM FOV AREA
+    // ============================================================
+
+    void MoveBeaconToRandomFovArea(
+        float minX,
+        float maxX,
+        float minY,
+        float maxY
+    )
+    {
+        float viewportX =
+            Random.Range(
+                minX,
+                maxX
+            );
+
+        float viewportY =
+            Random.Range(
+                minY,
+                maxY
+            );
+
+
+        MoveBeaconToFovPosition(
+            viewportX,
+            viewportY
+        );
+    }
+
+
+    // ============================================================
+    // BEACON DISTANCE
+    // ============================================================
+
+    float GetBeaconDistance()
+    {
+        if (trackingCamera == null)
+        {
+            trackingCamera =
+                Camera.main;
+        }
+
+        if (trackingCamera == null)
+            return 20f;
+
+
+        // --------------------------------------------------------
+        // Try to preserve the beacon's current distance from
+        // the camera.
+        // --------------------------------------------------------
+
+        float distance =
+            Vector3.Distance(
+                trackingCamera.transform.position,
+                beacon.transform.position
+            );
+
+
+        // --------------------------------------------------------
+        // Prevent an invalid or extremely small distance.
+        // --------------------------------------------------------
+
+        if (distance < 1f)
+        {
+            distance = 20f;
+        }
+
+
+        return distance;
+    }
+
+
+    // ============================================================
+    // BEACON OUT OF VIEW
+    // ============================================================
+
+    void MoveBeaconOutOfView()
+    {
+        if (beacon == null)
+            return;
+
+        if (trackingCamera == null)
+        {
+            trackingCamera =
+                Camera.main;
+        }
+
+        if (trackingCamera == null)
+        {
+            Debug.LogError(
+                "Tracking Camera not assigned!"
+            );
+
+            return;
+        }
+
+
+        // --------------------------------------------------------
+        // Put beacon behind the camera.
+        // --------------------------------------------------------
+
+        Vector3 position =
+            trackingCamera.transform.position
+            -
+            trackingCamera.transform.forward
+            * 20f;
+
+
+        beacon.transform.position =
+            position;
+
+
+        Debug.Log(
+            "Beacon moved OUT OF FOV"
         );
     }
 
@@ -254,38 +530,6 @@ public class SceneConfiguration : MonoBehaviour
             + blur
             + " | Turbulence: "
             + turbulence
-        );
-    }
-
-
-    // ============================================================
-    // BEACON OUT OF VIEW
-    // ============================================================
-
-    void MoveBeaconOutOfView()
-    {
-        if (beacon == null)
-            return;
-
-        Camera mainCamera =
-            Camera.main;
-
-        if (mainCamera == null)
-            return;
-
-
-        // Put beacon behind the camera.
-        Vector3 position =
-            mainCamera.transform.position
-            -
-            mainCamera.transform.forward * 20f;
-
-        beacon.transform.position =
-            position;
-
-
-        Debug.Log(
-            "Beacon moved OUT OF POV"
         );
     }
 
