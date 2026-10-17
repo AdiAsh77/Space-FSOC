@@ -1,3 +1,4 @@
+
 using UnityEngine;
 
 public class BeaconMovement : MonoBehaviour
@@ -6,13 +7,18 @@ public class BeaconMovement : MonoBehaviour
     public float movementSpeed = 1f;
     public float movementRange = 5f;
 
+    [Header("Satellite Avoidance")]
+    public Transform satellite;
+    public float avoidanceRadius = 10f;
+
     private string movementType = "Mixed";
 
     private Vector3 startPosition;
+    private Vector3 normalPosition;
+    private Vector3 randomTarget;
+    private Vector3 avoidanceOffset;
 
     private float time = 0f;
-
-    private Vector3 randomTarget;
 
 
     // ============================================================
@@ -21,8 +27,8 @@ public class BeaconMovement : MonoBehaviour
 
     void Start()
     {
-        startPosition =
-            transform.position;
+        normalPosition = transform.position;
+        startPosition = normalPosition;
 
         ChooseRandomTarget();
     }
@@ -34,47 +40,88 @@ public class BeaconMovement : MonoBehaviour
 
     void Update()
     {
-        time +=
-            Time.deltaTime *
-            movementSpeed;
+        time += Time.deltaTime * movementSpeed;
 
+        // Calculate the normal, predefined movement first.
+        switch (movementType)
+        {
+            case "Straight Horizontal":
+                normalPosition = startPosition +
+                    new Vector3(Mathf.Sin(time) * movementRange, 0f, 0f);
+                break;
 
-        if (
-            movementType == "Straight Horizontal"
-        )
-        {
-            MoveHorizontal();
+            case "Straight Vertical":
+                normalPosition = startPosition +
+                    new Vector3(0f, Mathf.Sin(time) * movementRange, 0f);
+                break;
+
+            case "Figure 8":
+                normalPosition = startPosition +
+                    new Vector3(
+                        Mathf.Sin(time) * movementRange,
+                        Mathf.Sin(time * 2f) * movementRange * 0.5f,
+                        0f
+                    );
+                break;
+
+            case "Circular":
+                normalPosition = startPosition +
+                    new Vector3(
+                        Mathf.Cos(time) * movementRange,
+                        Mathf.Sin(time) * movementRange,
+                        0f
+                    );
+                break;
+
+            case "Random":
+                normalPosition = Vector3.MoveTowards(
+                    normalPosition,
+                    randomTarget,
+                    movementSpeed * Time.deltaTime
+                );
+
+                if (Vector3.Distance(normalPosition, randomTarget) < 0.1f)
+                {
+                    ChooseRandomTarget();
+                }
+                break;
+
+            case "Mixed":
+                int pattern = Mathf.FloorToInt(time / 10f) % 4;
+
+                if (pattern == 0)
+                {
+                    normalPosition = startPosition +
+                        new Vector3(Mathf.Sin(time) * movementRange, 0f, 0f);
+                }
+                else if (pattern == 1)
+                {
+                    normalPosition = startPosition +
+                        new Vector3(0f, Mathf.Sin(time) * movementRange, 0f);
+                }
+                else if (pattern == 2)
+                {
+                    normalPosition = startPosition +
+                        new Vector3(
+                            Mathf.Sin(time) * movementRange,
+                            Mathf.Sin(time * 2f) * movementRange * 0.5f,
+                            0f
+                        );
+                }
+                else
+                {
+                    normalPosition = startPosition +
+                        new Vector3(
+                            Mathf.Cos(time) * movementRange,
+                            Mathf.Sin(time) * movementRange,
+                            0f
+                        );
+                }
+                break;
         }
-        else if (
-            movementType == "Straight Vertical"
-        )
-        {
-            MoveVertical();
-        }
-        else if (
-            movementType == "Figure 8"
-        )
-        {
-            MoveFigure8();
-        }
-        else if (
-            movementType == "Circular"
-        )
-        {
-            MoveCircular();
-        }
-        else if (
-            movementType == "Random"
-        )
-        {
-            MoveRandom();
-        }
-        else if (
-            movementType == "Mixed"
-        )
-        {
-            MoveMixed();
-        }
+
+        // Apply avoidance AFTER calculating normal movement.
+        ApplySatelliteAvoidance();
     }
 
 
@@ -82,202 +129,107 @@ public class BeaconMovement : MonoBehaviour
     // SET MOVEMENT TYPE
     // ============================================================
 
-    public void SetMovementType(
-        string type
-    )
+    public void SetMovementType(string type)
     {
+        // Recover the intended position, not the avoidance-adjusted
+        // position, when changing movement patterns.
+        normalPosition = transform.position - avoidanceOffset;
+        startPosition = normalPosition;
+
         movementType = type;
-
         time = 0f;
+        avoidanceOffset = Vector3.zero;
 
-        startPosition =
-            transform.position;
+        ChooseRandomTarget();
+
+        Debug.Log("Beacon movement type: " + movementType);
+    }
+
+
+    // ============================================================
+    // CONFIGURE SATELLITE AVOIDANCE
+    // ============================================================
+
+    public void SetAvoidanceSphere(Transform satelliteTransform, float radius)
+    {
+        satellite = satelliteTransform;
+        avoidanceRadius = Mathf.Max(0f, radius);
 
         Debug.Log(
-            "Beacon movement type: "
-            + movementType
+            "Beacon avoidance configured | Radius: "
+            + avoidanceRadius
         );
     }
 
 
     // ============================================================
-    // HORIZONTAL
-    //
-    // ← → ← →
+    // KEEP BEACON OUTSIDE SATELLITE'S EXCLUSION SPHERE
     // ============================================================
 
-    void MoveHorizontal()
+    void ApplySatelliteAvoidance()
     {
-        float x =
-            Mathf.Sin(time)
-            * movementRange;
+        // Reset the offset every frame.
+        // This prevents avoidance from permanently changing the path.
+        avoidanceOffset = Vector3.zero;
 
-        transform.position =
-            startPosition
-            +
-            new Vector3(
-                x,
-                0f,
-                0f
-            );
-    }
-
-
-    // ============================================================
-    // VERTICAL
-    //
-    // ↑ ↓ ↑ ↓
-    // ============================================================
-
-    void MoveVertical()
-    {
-        float y =
-            Mathf.Sin(time)
-            * movementRange;
-
-        transform.position =
-            startPosition
-            +
-            new Vector3(
-                0f,
-                y,
-                0f
-            );
-    }
-
-
-    // ============================================================
-    // FIGURE 8
-    // ============================================================
-
-    void MoveFigure8()
-    {
-        float x =
-            Mathf.Sin(time)
-            * movementRange;
-
-        float y =
-            Mathf.Sin(time * 2f)
-            * movementRange
-            * 0.5f;
-
-        transform.position =
-            startPosition
-            +
-            new Vector3(
-                x,
-                y,
-                0f
-            );
-    }
-
-
-    // ============================================================
-    // CIRCULAR
-    // ============================================================
-
-    void MoveCircular()
-    {
-        float x =
-            Mathf.Cos(time)
-            * movementRange;
-
-        float y =
-            Mathf.Sin(time)
-            * movementRange;
-
-        transform.position =
-            startPosition
-            +
-            new Vector3(
-                x,
-                y,
-                0f
-            );
-    }
-
-
-    // ============================================================
-    // RANDOM
-    // ============================================================
-
-    void MoveRandom()
-    {
-        transform.position =
-            Vector3.MoveTowards(
-                transform.position,
-                randomTarget,
-                movementSpeed
-                * Time.deltaTime
-            );
-
-        if (
-            Vector3.Distance(
-                transform.position,
-                randomTarget
-            ) < 0.1f
-        )
+        if (satellite == null || avoidanceRadius <= 0f)
         {
-            ChooseRandomTarget();
+            transform.position = normalPosition;
+            return;
         }
+
+        Vector3 fromSatellite =
+            normalPosition - satellite.position;
+
+        float distance = fromSatellite.magnitude;
+
+        // Beacon's intended position is outside the exclusion sphere.
+        if (distance >= avoidanceRadius)
+        {
+            transform.position = normalPosition;
+            return;
+        }
+
+        // Handle the rare case where both positions are identical.
+        Vector3 direction;
+
+        if (distance > 0.001f)
+        {
+            direction = fromSatellite / distance;
+        }
+        else
+        {
+            direction = startPosition - satellite.position;
+
+            if (direction.sqrMagnitude < 0.001f)
+            {
+                direction = Vector3.right;
+            }
+
+            direction.Normalize();
+        }
+
+        // Move the beacon to the sphere's surface.
+        Vector3 safePosition =
+            satellite.position + direction * avoidanceRadius;
+
+        avoidanceOffset = safePosition - normalPosition;
+
+        transform.position = safePosition;
     }
 
 
     // ============================================================
-    // CHOOSE RANDOM TARGET
+    // RANDOM TARGET
     // ============================================================
 
     void ChooseRandomTarget()
     {
-        randomTarget =
-            startPosition
-            +
+        randomTarget = startPosition +
             new Vector3(
-                Random.Range(
-                    -movementRange,
-                    movementRange
-                ),
-                Random.Range(
-                    -movementRange,
-                    movementRange
-                ),
+                Random.Range(-movementRange, movementRange),
+                Random.Range(-movementRange, movementRange),
                 0f
             );
-    }
-
-
-    // ============================================================
-    // MIXED
-    // ============================================================
-
-    void MoveMixed()
-    {
-        // Randomly choose a movement pattern.
-        //
-        // Change this later if you want Mixed to combine
-        // multiple patterns continuously.
-
-        int pattern =
-            Mathf.FloorToInt(
-                time / 10f
-            ) % 4;
-
-
-        if (pattern == 0)
-        {
-            MoveHorizontal();
-        }
-        else if (pattern == 1)
-        {
-            MoveVertical();
-        }
-        else if (pattern == 2)
-        {
-            MoveFigure8();
-        }
-        else
-        {
-            MoveCircular();
-        }
     }
 }

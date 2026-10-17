@@ -444,6 +444,20 @@ public class SceneConfiguration : MonoBehaviour
             SetRandomSatelliteRotation();
         }
 
+        
+        // --------------------------------------------------------
+        // Beacon-Satellite Exclusion Distance
+        // --------------------------------------------------------
+
+        if (satellite != null && beaconMovement != null)
+        {
+            beaconMovement.SetAvoidanceSphere(
+                satellite.transform,
+                settings.distance_from_beacon
+            );
+        }
+
+
 
         Debug.Log(
             "Satellite | "

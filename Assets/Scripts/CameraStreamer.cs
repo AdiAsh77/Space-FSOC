@@ -5,6 +5,7 @@ using System.Globalization;
 
 public class CameraStreamer : MonoBehaviour
 {
+    public GameObject strtui;
     public TrackingMetrics trackingMetrics;
     public MasterControl masterControl;
     public VideoGimbalController videoGimbalController;
@@ -416,6 +417,7 @@ public class CameraStreamer : MonoBehaviour
 
         if (message == "THIRD_VIEW")
         {
+            strtui.SetActive(false);
             masterControl.SwitchToVideo();
             thirdCamera.targetDisplay = 0;
             cam.targetDisplay = 1;
@@ -582,6 +584,7 @@ public class CameraStreamer : MonoBehaviour
         simulationPaused = false;
 
         Time.timeScale = 1f;
+        strtui.SetActive(false);
 
         Debug.Log(
             "=============================="
